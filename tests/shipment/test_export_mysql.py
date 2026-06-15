@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+import unittest
+from decimal import Decimal
+from unittest.mock import patch
+
+import src.shipment.export_mysql as export_mysql
+from src.shipment.export_mysql import MYSQL_COLUMNS, MySQLConfig, MySQLExportError, build_upsert_sql, mysql_row_values, validate_table_columns
+from src.shipment.models import CustomsRow
+
+
+def sample_row() -> CustomsRow:
+    return CustomsRow(
+        id="abc123",
+        shipment_date="2026-06",
+        shipment_no="SP260609001",
+        purchase_entity="采购方",
+        supplier="供应商",
+        domestic_source="供应商地址",
+        sku="00123",
+        pieces=Decimal("4"),
+        product_name="品名",
+        customs_name_cn="中文名",
+        customs_name_en="",
+        unit="件",
+        shipment_quantity=Decimal("52"),
+        purchase_unit_price=Decimal("8.75"),
+        updated_at="2026-06-09 12:00:00",
+        trade_term="FOB",
+        payment_method_name="t/t",
+        currency="美元",
+        logistics_provider="物流商",
+        logistics_channel="物流渠道",
+        transport_method="快递",
+        logistics_method="旧物流方式",
+        logistics_center_code="ABE8",
+        package_type="cnts",
+        box_no="BOX001",
+        box_count=Decimal("1"),
+        total_gross_weight=Decimal("21.41"),
+        total_net_weight=Decimal("20.41"),
+        outer_box_size="55*43*31",
+        volume=Decimal("0.073"),
+    )
+
+
+class ExportMySQLTest(unittest.TestCase):
+    def test_mysql_columns_use_required_order_and_transport_method(self) -> None:
+        self.assertEqual([column for _, column in MYSQL_COLUMNS], [
+            "id",
+            "shipment_date",
+            "shipment_no",
+            "purchase_entity",
+            "supplier",
+            "domestic_source",
+            "trade_term",
+            "payment_method_name",
+            "currency",
+            "sku",
+            "pieces",
+            "product_name",
+            "customs_name_cn",
+            "customs_name_en",
+            "unit",
+            "shipment_quantity",
+            "purchase_unit_price",
+            "logistics_provider",
+            "logistics_channel",
+            "transport_method",
+            "logistics_center_code",
+            "package_type",
+            "box_no",
+            "box_count",
+            "total_gross_weight",
+            "total_net_weight",
+            "outer_box_size",
+            "volume",
+            "updated_at",
+        ])
+
+    def test_mysql_row_values_convert_decimals_and_keep_empty_english_name_blank(self) -> None:
+        values = mysql_row_values(sample_row())
+
+        self.assertEqual(values[0], "abc123")
+        self.assertEqual(values[13], "")
+        self.assertEqual(values[19], "快递")
+        self.assertEqual(values[23], "1")
+        self.assertEqual(values[24], "21.41")
+
+    def test_upsert_sql_updates_all_columns_except_id(self) -> None:
+        sql = build_upsert_sql("customs_bill_parcels")
+
+        self.assertIn("INSERT INTO `customs_bill_parcels`", sql)
+        self.assertIn("`transport_method`", sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)
+        update_clause = sql.split("ON DUPLICATE KEY UPDATE", 1)[1]
+        self.assertNotIn("`id`=VALUES(`id`)", update_clause)
+        self.assertIn("`updated_at`=VALUES(`updated_at`)", update_clause)
+
+    def test_validate_table_columns_reports_missing_columns(self) -> None:
+        columns = [column for _, column in MYSQL_COLUMNS if column not in {"transport_method", "updated_at"}]
+
+        with self.assertRaises(MySQLExportError) as context:
+            validate_table_columns(columns)
+
+        message = str(context.exception)
+        self.assertIn("transport_method", message)
+        self.assertIn("updated_at", message)
+
+    def test_open_mysql_connection_uses_direct_host_when_tunnel_disabled(self) -> None:
+        fake_pymysql = FakePyMySQL()
+        config = mysql_config(use_ssh_tunnel=False)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql):
+            connection, tunnel = export_mysql._open_mysql_connection(config)
+
+        self.assertIsNone(tunnel)
+        self.assertIs(connection, fake_pymysql.connection)
+        self.assertEqual(fake_pymysql.connect_kwargs["host"], "172.31.0.4")
+        self.assertEqual(fake_pymysql.connect_kwargs["port"], 3306)
+
+    def test_open_mysql_connection_uses_ssh_tunnel_local_port_when_enabled(self) -> None:
+        fake_pymysql = FakePyMySQL()
+        fake_tunnel_factory = FakeTunnelFactory(local_bind_port=43306)
+        config = mysql_config(use_ssh_tunnel=True)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql), patch.object(
+            export_mysql, "SSHTunnelForwarderFactory", fake_tunnel_factory
+        ):
+            connection, tunnel = export_mysql._open_mysql_connection(config)
+
+        self.assertIs(connection, fake_pymysql.connection)
+        self.assertIs(tunnel, fake_tunnel_factory.tunnel)
+        self.assertTrue(tunnel.started)
+        self.assertEqual(fake_pymysql.connect_kwargs["host"], "127.0.0.1")
+        self.assertEqual(fake_pymysql.connect_kwargs["port"], 43306)
+        self.assertEqual(fake_tunnel_factory.kwargs["remote_bind_address"], ("172.31.0.4", 3306))
+
+    def test_open_mysql_connection_stops_tunnel_when_mysql_connect_fails(self) -> None:
+        fake_pymysql = FakePyMySQL(connect_error=RuntimeError("mysql down"))
+        fake_tunnel_factory = FakeTunnelFactory(local_bind_port=43306)
+        config = mysql_config(use_ssh_tunnel=True)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql), patch.object(
+            export_mysql, "SSHTunnelForwarderFactory", fake_tunnel_factory
+        ):
+            with self.assertRaises(MySQLExportError):
+                export_mysql._open_mysql_connection(config)
+
+        self.assertTrue(fake_tunnel_factory.tunnel.stopped)
+
+    def test_mysql_config_requires_ssh_settings_when_tunnel_enabled(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "MYSQL_HOST": "172.31.0.4",
+                "MYSQL_PORT": "3306",
+                "MYSQL_USER": "gmb001",
+                "MYSQL_PASSWORD": "secret",
+                "MYSQL_DATABASE": "dtw_gmb000053",
+                "MYSQL_TABLE": "customs_bill_parcels",
+                "MYSQL_USE_SSH_TUNNEL": "1",
+                "SSH_HOST": "",
+                "SSH_USER": "",
+                "SSH_PASSWORD": "",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(MySQLExportError) as context:
+                MySQLConfig.from_env()
+
+        self.assertIn("SSH_HOST", str(context.exception))
+
+
+def mysql_config(use_ssh_tunnel: bool) -> MySQLConfig:
+    return MySQLConfig(
+        host="172.31.0.4",
+        port=3306,
+        user="gmb001",
+        password="secret",
+        database="dtw_gmb000053",
+        table="customs_bill_parcels",
+        use_ssh_tunnel=use_ssh_tunnel,
+        ssh_host="115.190.118.240",
+        ssh_port=22,
+        ssh_user="root",
+        ssh_password="ssh-secret",
+    )
+
+
+class FakeConnection:
+    pass
+
+
+class FakePyMySQL:
+    def __init__(self, connect_error: Exception | None = None) -> None:
+        self.connect_error = connect_error
+        self.connection = FakeConnection()
+        self.connect_kwargs = {}
+
+    def connect(self, **kwargs):
+        self.connect_kwargs = kwargs
+        if self.connect_error is not None:
+            raise self.connect_error
+        return self.connection
+
+
+class FakeTunnel:
+    def __init__(self, local_bind_port: int) -> None:
+        self.local_bind_port = local_bind_port
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class FakeTunnelFactory:
+    def __init__(self, local_bind_port: int) -> None:
+        self.tunnel = FakeTunnel(local_bind_port)
+        self.kwargs = {}
+
+    def __call__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        return self.tunnel
+
+
+if __name__ == "__main__":
+    unittest.main()
