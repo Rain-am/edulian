@@ -256,7 +256,7 @@ def _build_row(
     volume = _row_volume(item, sku_info, ratio)
     product_name = item.product_name or sku_info.product_name
     pieces = _pieces_from_product_name(product_name, sku_info.unit, item.pieces)
-    box_no = item.box_no
+    box_no = _display_box_no(item.box_no)
     box_count = _box_count_from_box_no(box_no) or item.box_count
 
     return CustomsRow(
@@ -308,6 +308,14 @@ def _shipment_month(value: str) -> str:
 def _row_id(shipment_no: str, sku: str, box_no: str) -> str:
     source = "|".join((shipment_no or "", sku or "", box_no or ""))
     return hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
+
+
+def _display_box_no(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts = [part.strip() for part in re.split(r"[\r\n,;/，；]+", text) if part.strip()]
+    return ",".join(parts) if len(parts) > 1 else text
 
 
 def _format_box_no(value: str) -> str:

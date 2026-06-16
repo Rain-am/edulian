@@ -1,75 +1,86 @@
-# Lingxing FBA Customs Automation
+# 领星报关自动化
 
-This project generates a customs declaration workbook from real Lingxing FBA shipment data.
+本项目用于从领星 API 拉取 FBA 发货计划和本地产品资料，生成报关 Excel，并支持将发货计划明细写入 MySQL。
 
-## Real API Run
+## 目录结构
 
-1. Create local config:
+```text
+src/
+  common/      # 领星鉴权客户端、通用 Excel 能力
+  shipment/    # 发货计划：拉取、拼接报关明细、导出 Excel、写入 MySQL
+  product/     # 物料表：产品列表/详情拉取、20 条预览导出
+tests/         # 单元测试
+docs/          # 领星接口截图和字段依据
+scripts/       # Linux 部署、检查、定时任务脚本
+```
+
+## 本地初始化
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-2. Fill `.env`:
+然后在 `.env` 中填写领星 API、MySQL 和可选 SSH 隧道配置。真实密钥、数据库密码、SSH 密码只放 `.env`，不要提交到 GitHub。
 
-- `LINGXING_BASE_URL`
-- `LINGXING_APP_ID`
-- `LINGXING_APP_SECRET`
-- `LINGXING_ACCESS_TOKEN` if required by your Lingxing API version
-- `LINGXING_FBA_SHIPMENT_LIST_ENDPOINT`: defaults to `/erp/sc/routing/storage/shipment/getInboundShipmentList`
-- `LINGXING_FBA_SHIPMENT_DETAIL_ENDPOINT`: defaults to `/erp/sc/routing/storage/shipment/getInboundShipmentListMwsDetail`
-- `LINGXING_SKU_DETAIL_ENDPOINT`: defaults to `/erp/sc/routing/data/local_inventory/productInfo`
+## 常用命令
 
-3. Run:
+检查领星鉴权：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py --shipment-time 2026-06-10 --output output\报关明细.xlsx
+.\.venv\Scripts\python.exe main.py --check-auth
 ```
 
-## Sample Data
-
-Sample data is only for testing Excel generation. It is never used unless you explicitly add:
+查看当前公网 IP，便于配置领星白名单：
 
 ```powershell
---use-sample-data
+.\.venv\Scripts\python.exe main.py --show-ip --ip-repeat 3
 ```
 
-## Output Sheets
+生成发货计划报关 Excel：
 
-- `报关明细`: customs declaration rows.
-- `问题清单`: missing fields and data issues.
-- `采购拆分明细`: purchase order, supplier, and batch split details.
+```powershell
+.\.venv\Scripts\python.exe main.py --job shipment --shipment-time 2026-06-13 --output output\real-2026-06-13.xlsx --debug-api
+```
 
-## Current Integration Point
+生成发货计划报关 Excel 并写入 MySQL：
 
-The API client and data mapping are implemented in `src/fetchers/lingxing_api.py`.
-The shipment list request filters `status=已发货` by default. Purchase unit price comes from `fba_stock_cost` in the FBA shipment list/detail payload.
-The shipment list request sends one shipment date plus `time_type=0` by default.
+```powershell
+.\.venv\Scripts\python.exe main.py --job shipment --shipment-time 2026-06-13 --output output\real-2026-06-13.xlsx --write-db --debug-api
+```
 
-If the Lingxing API rejects the status or date parameter names, adjust these `.env` values:
+生成物料表 20 条预览：
 
-- `LINGXING_SHIPMENT_STATUS_FIELD`
-- `LINGXING_SHIPMENT_TIME_FIELD`
-- `LINGXING_SHIPMENT_TIME_TYPE_FIELD`
-- `LINGXING_SHIPMENT_TIME_TYPE`
+```powershell
+.\.venv\Scripts\python.exe main.py --job product-preview --limit 20 --output output\product-preview-20.xlsx --debug-api
+```
 
-## Cloud Server Deploy
+## 发货计划输出
 
-Generate a clean deploy folder on Windows:
+发货计划主表按 `发货单号 + SKU + 箱号` 生成稳定主键 `id`。主要字段包括确定出运月份、发货单号、采购主体、供应商、供应商地址、成交方式、付款方式名称、币别、SKU、份数、品名、中英文报关品名、单位、发货数量、采购价格、物流信息、箱号、箱数、重量、尺寸、体积和更新时间。
+
+箱号来自“查询 FBA 发货单详情”的 `data.items[].box_no`，多个箱号会用英文逗号分隔。
+
+## 物料表预览
+
+物料表预览从产品列表接口获取 SKU 和更新时间，再调用产品详情接口补充品名、中文材质、单位、中文报关品名和海关编码。目前只导出 Excel 预览，不写入数据库。
+
+## 测试
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m compileall -q main.py src tests
+```
+
+## 云服务器部署
+
+生成干净部署目录：
 
 ```powershell
 .\scripts\make_deploy.ps1
 ```
 
-This creates `deploy_package` under the project folder. It does not copy `.env`, `.venv`, `logs`, `output`, caches, or local debug files.
-
-To generate a sibling folder instead:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\make_deploy.ps1 -DeployPath "D:\work files\领星报关_deploy"
-```
-
-Upload `deploy_package` to the Linux cloud server, then run:
+上传 `deploy_package` 到 Linux 云服务器后执行：
 
 ```bash
 bash scripts/setup_linux.sh
@@ -79,16 +90,10 @@ bash scripts/check.sh
 bash scripts/run_once.sh
 ```
 
-Install the 20-minute cron job after the manual run succeeds:
+确认手动运行成功后安装每 20 分钟执行一次的定时任务：
 
 ```bash
 bash scripts/install_cron.sh
 crontab -l
 tail -f logs/cron.log
-```
-
-For a specific shipment date:
-
-```bash
-SHIPMENT_TIME=2026-06-09 bash scripts/run_once.sh
 ```

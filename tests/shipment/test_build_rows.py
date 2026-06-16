@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from src.shipment.build_rows import _box_count_from_box_no, build_customs_workbook_data
+from src.shipment.build_rows import _box_count_from_box_no, _display_box_no, build_customs_workbook_data
 from src.shipment.models import PurchaseBatch, RawCustomsData, ShipmentItem, SkuInfo
 from src.shipment.sample_data import SampleDataSource
 
@@ -12,6 +12,11 @@ class BuildCustomsRowsTest(unittest.TestCase):
     def test_box_count_counts_numeric_ranges(self) -> None:
         self.assertEqual(_box_count_from_box_no("1-3"), Decimal("3"))
         self.assertEqual(_box_count_from_box_no("1,3-4"), Decimal("3"))
+
+    def test_display_box_no_uses_commas_for_multiple_boxes(self) -> None:
+        self.assertEqual(_display_box_no("FBA001\nFBA002\nFBA003"), "FBA001,FBA002,FBA003")
+        self.assertEqual(_display_box_no("FBA001;FBA002/FBA003"), "FBA001,FBA002,FBA003")
+        self.assertEqual(_display_box_no("FBA001"), "FBA001")
 
     def test_builds_rows_split_by_purchase_batch(self) -> None:
         raw = SampleDataSource().load()
@@ -55,7 +60,7 @@ class BuildCustomsRowsTest(unittest.TestCase):
         self.assertEqual(rows[0].id, rows[1].id)
         self.assertNotEqual(rows[0].id, rows[2].id)
 
-    def test_customs_row_uses_detail_item_box_no(self) -> None:
+    def test_customs_row_uses_comma_separated_box_no_but_purchase_split_keeps_original(self) -> None:
         original_box_no = "FBA19FS69HZGU000001\nFBA19FS69HZGU000002\nFBA19FS69HZGU000003"
         raw = RawCustomsData(
             shipment_items=[
@@ -98,7 +103,7 @@ class BuildCustomsRowsTest(unittest.TestCase):
 
         workbook_data = build_customs_workbook_data(raw)
 
-        self.assertEqual(workbook_data.customs_rows[0].box_no, original_box_no)
+        self.assertEqual(workbook_data.customs_rows[0].box_no, "FBA19FS69HZGU000001,FBA19FS69HZGU000002,FBA19FS69HZGU000003")
         self.assertEqual(workbook_data.customs_rows[0].box_count, Decimal("3"))
         self.assertEqual(workbook_data.purchase_split_rows[0].box_no, original_box_no)
 
