@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -11,34 +12,35 @@ from src.shipment.models import CustomsRow, CustomsWorkbookData
 
 MYSQL_COLUMNS = [
     ("id", "id"),
-    ("shipment_date", "shipment_date"),
-    ("shipment_no", "shipment_no"),
-    ("purchase_entity", "purchase_entity"),
-    ("supplier", "supplier"),
-    ("domestic_source", "domestic_source"),
-    ("trade_term", "trade_term"),
-    ("payment_method_name", "payment_method_name"),
+    ("shipment_date", "confirm_shipment_month"),
+    ("shipment_day", "confirm_shipment"),
+    ("shipment_no", "tran_id"),
+    ("purchase_entity", "working_corp_name"),
+    ("supplier", "supplier_name"),
+    ("domestic_source", "supplier_addr"),
+    ("trade_term", "price_term"),
+    ("payment_method_name", "pay_term"),
     ("currency", "currency"),
-    ("sku", "sku"),
-    ("pieces", "pieces"),
-    ("product_name", "product_name"),
-    ("customs_name_cn", "customs_name_cn"),
-    ("customs_name_en", "customs_name_en"),
+    ("sku", "item_code"),
+    ("pieces", "copies"),
+    ("product_name", "name"),
+    ("customs_name_cn", "chinese_customs_name"),
+    ("customs_name_en", "english_customs_name"),
     ("unit", "unit"),
-    ("shipment_quantity", "shipment_quantity"),
-    ("purchase_unit_price", "purchase_unit_price"),
-    ("logistics_provider", "logistics_provider"),
+    ("shipment_quantity", "quantity"),
+    ("purchase_unit_price", "purchase_price"),
+    ("logistics_provider", "logistics_name"),
     ("logistics_channel", "logistics_channel"),
-    ("transport_method", "transport_method"),
-    ("logistics_center_code", "logistics_center_code"),
-    ("package_type", "package_type"),
+    ("transport_method", "tran_way"),
+    ("logistics_center_code", "center_id"),
+    ("package_type", "package"),
     ("box_no", "box_no"),
-    ("box_count", "box_count"),
-    ("total_gross_weight", "total_gross_weight"),
-    ("total_net_weight", "total_net_weight"),
-    ("outer_box_size", "outer_box_size"),
-    ("volume", "volume"),
-    ("updated_at", "updated_at"),
+    ("box_count", "packing_carton_num"),
+    ("total_gross_weight", "item_total_gross_weight"),
+    ("total_net_weight", "item_total_net_weight"),
+    ("outer_box_size", "measure"),
+    ("volume", "cube"),
+    ("updated_at", "update_time"),
 ]
 
 SSHTunnelForwarderFactory: Any | None = None
@@ -47,6 +49,14 @@ PyMySQLModule: Any | None = None
 
 class MySQLExportError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class MySQLPreflightResult:
+    table: str
+    row_count: int
+    duplicate_id_count: int = 0
+    delete_before: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,23 +118,24 @@ class MySQLConfig:
         return config
 
 
-def export_customs_rows_to_mysql(data: CustomsWorkbookData, config: MySQLConfig | None = None) -> int:
+def export_customs_rows_to_mysql(data: CustomsWorkbookData, config: MySQLConfig | None = None, delete_before: str | None = None) -> int:
     config = config or MySQLConfig.from_env()
     rows = [mysql_row_values(row) for row in data.customs_rows]
-    if not rows:
-        return 0
 
     connection = None
     tunnel = None
     try:
         connection, tunnel = _open_mysql_connection(config)
         with connection.cursor() as cursor:
-            table_columns = _fetch_table_columns(cursor, config.table)
-            validate_table_columns(table_columns)
-            cursor.executemany(build_upsert_sql(config.table), rows)
+            _validate_mysql_target(cursor, config.table, data)
+            if delete_before:
+                cursor.execute(build_delete_before_sql(config.table), (_mysql_shipment_day_value(delete_before),))
+            if rows:
+                cursor.executemany(build_upsert_sql(config.table), rows)
         connection.commit()
     except Exception:
-        connection.rollback()
+        if connection is not None:
+            connection.rollback()
         raise
     finally:
         if connection is not None:
@@ -132,6 +143,26 @@ def export_customs_rows_to_mysql(data: CustomsWorkbookData, config: MySQLConfig 
         if tunnel is not None:
             tunnel.stop()
     return len(rows)
+
+
+def preflight_customs_rows_mysql(
+    data: CustomsWorkbookData,
+    config: MySQLConfig | None = None,
+    delete_before: str | None = None,
+) -> MySQLPreflightResult:
+    config = config or MySQLConfig.from_env()
+    connection = None
+    tunnel = None
+    try:
+        connection, tunnel = _open_mysql_connection(config)
+        with connection.cursor() as cursor:
+            _validate_mysql_target(cursor, config.table, data)
+    finally:
+        if connection is not None:
+            connection.close()
+        if tunnel is not None:
+            tunnel.stop()
+    return MySQLPreflightResult(table=config.table, row_count=len(data.customs_rows), duplicate_id_count=0, delete_before=delete_before)
 
 
 def _open_mysql_connection(config: MySQLConfig) -> tuple[Any, Any | None]:
@@ -194,6 +225,10 @@ def _ssh_tunnel_factory() -> Any:
     if SSHTunnelForwarderFactory is not None:
         return SSHTunnelForwarderFactory
     try:
+        import paramiko
+
+        if not hasattr(paramiko, "DSSKey"):
+            paramiko.DSSKey = paramiko.RSAKey
         from sshtunnel import SSHTunnelForwarder
     except ImportError as exc:
         raise MySQLExportError("sshtunnel is not installed. Run: .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt") from exc
@@ -201,7 +236,7 @@ def _ssh_tunnel_factory() -> Any:
 
 
 def mysql_row_values(row: CustomsRow) -> tuple[Any, ...]:
-    return tuple(_mysql_value(getattr(row, attr)) for attr, _ in MYSQL_COLUMNS)
+    return tuple(_mysql_row_value(attr, getattr(row, attr)) for attr, _ in MYSQL_COLUMNS)
 
 
 def build_upsert_sql(table: str) -> str:
@@ -216,12 +251,46 @@ def build_upsert_sql(table: str) -> str:
     return f"INSERT INTO {_quote_identifier(table)} ({column_sql}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_sql}"
 
 
+def build_delete_before_sql(table: str) -> str:
+    return f"DELETE FROM {_quote_identifier(table)} WHERE `confirm_shipment` < %s"
+
+
 def validate_table_columns(table_columns: Iterable[str]) -> None:
     actual = {column.lower() for column in table_columns}
     required = [column for _, column in MYSQL_COLUMNS]
     missing = [column for column in required if column.lower() not in actual]
     if missing:
         raise MySQLExportError("customs_bill_parcels is missing columns: " + ", ".join(missing))
+
+
+def validate_unique_id_index(index_rows: Iterable[Any]) -> None:
+    indexes: dict[str, dict[str, Any]] = {}
+    for row in index_rows:
+        key_name = _row_value(row, "Key_name", 2)
+        if not key_name:
+            continue
+        index = indexes.setdefault(str(key_name), {"non_unique": _row_value(row, "Non_unique", 1), "columns": []})
+        index["columns"].append((int(_row_value(row, "Seq_in_index", 3) or 0), str(_row_value(row, "Column_name", 4) or "")))
+
+    for index in indexes.values():
+        if str(index["non_unique"]) not in {"0", "False", "false"}:
+            continue
+        columns = [column for _, column in sorted(index["columns"])]
+        if columns == ["id"]:
+            return
+    raise MySQLExportError("customs_bill_parcels requires a PRIMARY KEY or UNIQUE index on id")
+
+
+def validate_unique_row_ids(data: CustomsWorkbookData) -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for row in data.customs_rows:
+        if row.id in seen:
+            duplicates.add(row.id)
+        seen.add(row.id)
+    if duplicates:
+        preview = ", ".join(sorted(duplicates)[:10])
+        raise MySQLExportError(f"Current batch contains duplicate id values: {preview}")
 
 
 def _fetch_table_columns(cursor: Any, table: str) -> set[str]:
@@ -237,12 +306,65 @@ def _fetch_table_columns(cursor: Any, table: str) -> set[str]:
     return columns
 
 
+def _fetch_table_indexes(cursor: Any, table: str) -> list[Any]:
+    cursor.execute(f"SHOW INDEX FROM {_quote_identifier(table)}")
+    return list(cursor.fetchall())
+
+
+def _validate_mysql_target(cursor: Any, table: str, data: CustomsWorkbookData) -> None:
+    validate_unique_row_ids(data)
+    validate_table_columns(_fetch_table_columns(cursor, table))
+    validate_unique_id_index(_fetch_table_indexes(cursor, table))
+
+
+def _row_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    return row[index] if len(row) > index else None
+
+
 def _mysql_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     if value is None:
         return ""
     return value
+
+
+def _mysql_row_value(attr: str, value: Any) -> Any:
+    if attr == "shipment_date":
+        return _mysql_shipment_month_value(value)
+    if attr == "shipment_day":
+        return _mysql_shipment_day_value(value)
+    return _mysql_value(value)
+
+
+def _mysql_shipment_month_value(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if len(text) == 7 and text[4:5] == "-":
+        return text
+    elif len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        text = text[:7]
+    else:
+        return None
+    try:
+        datetime.strptime(text, "%Y-%m")
+    except ValueError:
+        return None
+    return text
+
+
+def _mysql_shipment_day_value(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        text = text[:10]
+    else:
+        return None
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return text
 
 
 def _quote_identifier(value: str) -> str:

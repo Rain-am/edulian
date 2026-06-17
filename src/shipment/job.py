@@ -1,26 +1,48 @@
 from __future__ import annotations
 
-from datetime import datetime
+import json
+import os
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from src.common.cache import JsonCache
 from src.shipment.build_rows import build_customs_workbook_data
 from src.shipment.export_excel import export_customs_workbook
-from src.shipment.export_mysql import export_customs_rows_to_mysql
+from src.shipment.export_mysql import export_customs_rows_to_mysql, preflight_customs_rows_mysql
 from src.shipment.fetcher import LingxingApiDataSource
+from src.shipment.models import RawCustomsData
 from src.shipment.sample_data import SampleDataSource
 
 
 def run_shipment_job(args: Any) -> None:
-    data_source = SampleDataSource() if args.use_sample_data else LingxingApiDataSource()
-    raw_data = data_source.load(shipment_time=args.shipment_time)
+    if args.clear_cache:
+        JsonCache().clear()
+        print("Lingxing master-data cache cleared.")
+    data_source = SampleDataSource() if args.use_sample_data else LingxingApiDataSource(refresh_cache=args.refresh_cache)
+    shipment_times = _shipment_times(args)
+    raw_data = _load_raw_data_for_dates(data_source, shipment_times)
     workbook_data = build_customs_workbook_data(raw_data)
     output_path = _export_with_available_path(workbook_data, Path(args.output))
+    delete_before = _delete_before_date()
+    if args.db_preflight:
+        result = preflight_customs_rows_mysql(workbook_data, delete_before=delete_before)
+        print("MySQL preflight: OK")
+        print(f"MySQL target table: {result.table}")
+        print(f"MySQL rows ready: {result.row_count}")
+        print(f"MySQL duplicate ids in current batch: {result.duplicate_id_count}")
+        print(f"MySQL delete cutoff: confirm_shipment < {result.delete_before}")
     if args.write_db:
-        db_rows = export_customs_rows_to_mysql(workbook_data)
+        result = preflight_customs_rows_mysql(workbook_data, delete_before=delete_before)
+        print("MySQL preflight: OK")
+        print(f"MySQL target table: {result.table}")
+        print(f"MySQL rows ready: {result.row_count}")
+        print(f"MySQL delete cutoff: confirm_shipment < {result.delete_before}")
+        db_rows = export_customs_rows_to_mysql(workbook_data, delete_before=delete_before)
         print(f"MySQL rows upserted: {db_rows}")
 
     print(f"Generated customs workbook: {output_path.resolve()}")
+    print("Shipment dates: " + ", ".join(shipment_times))
     print(f"Customs rows: {len(workbook_data.customs_rows)}")
     print(f"Issue rows: {len(workbook_data.issue_rows)}")
     print(f"Purchase split rows: {len(workbook_data.purchase_split_rows)}")
@@ -31,6 +53,33 @@ def run_shipment_job(args: Any) -> None:
         print("Purchase entities: " + ", ".join(purchase_entities[:10]))
     if not workbook_data.purchase_split_rows:
         print("Warning: no purchase split rows were generated; shipment detail did not provide purchase_items/purchase_sn.")
+    _print_api_performance_summary()
+
+
+def _shipment_times(args: Any) -> list[str]:
+    if getattr(args, "shipment_time_provided", False):
+        return [args.shipment_time]
+    today = _today()
+    return [(today - timedelta(days=1)).isoformat(), today.isoformat()]
+
+
+def _delete_before_date() -> str:
+    return (_today() - timedelta(days=1)).isoformat()
+
+
+def _today() -> date:
+    return date.today()
+
+
+def _load_raw_data_for_dates(data_source: Any, shipment_times: list[str]) -> RawCustomsData:
+    combined = RawCustomsData()
+    for shipment_time in shipment_times:
+        raw_data = data_source.load(shipment_time=shipment_time)
+        combined.shipment_items.extend(raw_data.shipment_items)
+        combined.purchase_batches.extend(raw_data.purchase_batches)
+        combined.sku_infos.update(raw_data.sku_infos)
+        combined.metadata.update(raw_data.metadata)
+    return combined
 
 
 def _export_with_available_path(workbook_data, output_path: Path) -> Path:
@@ -43,3 +92,23 @@ def _export_with_available_path(workbook_data, output_path: Path) -> Path:
         export_customs_workbook(workbook_data, fallback_path)
         print(f"Output file is in use, wrote a new file instead: {fallback_path}")
         return fallback_path
+
+
+def _print_api_performance_summary() -> None:
+    debug_dir = os.getenv("LINGXING_DEBUG_DIR", "")
+    if not debug_dir:
+        return
+    summary_path = Path(debug_dir) / "performance_summary.json"
+    if not summary_path.exists():
+        return
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    print("Lingxing API performance summary:")
+    for endpoint, item in sorted(summary.items(), key=lambda pair: float(pair[1].get("total_seconds", 0)), reverse=True)[:10]:
+        print(
+            f"  {endpoint}: calls={item.get('count', 0)}, "
+            f"seconds={float(item.get('total_seconds', 0)):.2f}, "
+            f"errors={item.get('error_count', 0)}"
+        )

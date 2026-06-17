@@ -25,7 +25,6 @@ class ShipmentItem:
     logistics_provider: str = ""
     logistics_channel: str = ""
     transport_method: str = ""
-    logistics_method: str = ""
     logistics_center_code: str = ""
     volume: Decimal | None = None
     total_gross_weight: Decimal | None = None
@@ -80,6 +79,7 @@ class RawCustomsData:
 class CustomsRow:
     id: str
     shipment_date: str
+    shipment_day: str
     shipment_no: str
     purchase_entity: str
     supplier: str
@@ -99,7 +99,6 @@ class CustomsRow:
     logistics_provider: str
     logistics_channel: str
     transport_method: str
-    logistics_method: str
     logistics_center_code: str
     package_type: str
     box_no: str

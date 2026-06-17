@@ -251,17 +251,19 @@ def _build_row(
     purchase_unit_price: Decimal | str,
 ) -> CustomsRow:
     ratio = _quantity_ratio(item, quantity)
-    total_gross_weight = _row_gross_weight(item, sku_info, quantity, ratio)
-    total_net_weight = _row_net_weight(item, sku_info, quantity, ratio, total_gross_weight)
-    volume = _row_volume(item, sku_info, ratio)
-    product_name = item.product_name or sku_info.product_name
-    pieces = _pieces_from_product_name(product_name, sku_info.unit, item.pieces)
     box_no = _display_box_no(item.box_no)
     box_count = _box_count_from_box_no(box_no) or item.box_count
+    total_gross_weight = _row_gross_weight(item, sku_info, quantity, ratio)
+    total_net_weight = _row_net_weight(item, sku_info, quantity, ratio, total_gross_weight, box_count)
+    volume = _row_volume(item, sku_info, ratio)
+    product_name = item.product_name or sku_info.product_name
+    unit = sku_info.unit or _unit_from_product_name(product_name)
+    pieces = _pieces_from_product_name(product_name, unit, item.pieces)
 
     return CustomsRow(
         id=_row_id(item.shipment_no, item.sku, box_no),
         shipment_date=_shipment_month(item.shipment_date),
+        shipment_day=_shipment_day(item.shipment_date),
         shipment_no=item.shipment_no,
         purchase_entity=purchase_entity,
         supplier=supplier,
@@ -271,7 +273,7 @@ def _build_row(
         product_name=product_name,
         customs_name_cn=sku_info.customs_name_cn or PENDING,
         customs_name_en=sku_info.customs_name_en,
-        unit=sku_info.unit or PENDING,
+        unit=unit or PENDING,
         shipment_quantity=quantity * pieces,
         purchase_unit_price=purchase_unit_price,
         updated_at=item.updated_at,
@@ -281,7 +283,6 @@ def _build_row(
         logistics_provider=item.logistics_provider,
         logistics_channel=item.logistics_channel,
         transport_method=item.transport_method,
-        logistics_method=item.logistics_method,
         logistics_center_code=item.logistics_center_code,
         package_type="cnts",
         box_no=box_no,
@@ -302,6 +303,12 @@ def _calculate_volume(sku_info: SkuInfo, box_count: Decimal) -> Decimal | str:
 def _shipment_month(value: str) -> str:
     if len(value) >= 7 and value[4:5] == "-":
         return value[:7]
+    return value
+
+
+def _shipment_day(value: str) -> str:
+    if len(value) >= 10 and value[4:5] == "-" and value[7:8] == "-":
+        return value[:10]
     return value
 
 
@@ -403,9 +410,10 @@ def _row_net_weight(
     quantity: Decimal,
     ratio: Decimal,
     total_gross_weight: Decimal | str,
+    box_count: Decimal,
 ) -> Decimal | str:
     if isinstance(total_gross_weight, Decimal):
-        return total_gross_weight - item.box_count
+        return total_gross_weight - box_count
     if sku_info.net_weight is not None:
         return sku_info.net_weight * quantity
     return PENDING
@@ -420,7 +428,7 @@ def _row_volume(item: ShipmentItem, sku_info: SkuInfo, ratio: Decimal) -> Decima
 def _pieces_from_product_name(product_name: str, unit: str, fallback: Decimal) -> Decimal:
     text = product_name or ""
     units = [unit] if unit else []
-    units.extend(["件", "个", "条", "套", "只", "双", "片", "包", "pcs", "PCS"])
+    units.extend(_KNOWN_UNITS)
     for candidate_unit in units:
         if not candidate_unit:
             continue
@@ -428,6 +436,17 @@ def _pieces_from_product_name(product_name: str, unit: str, fallback: Decimal) -
         if match:
             return Decimal(match.group(1))
     return fallback
+
+
+_KNOWN_UNITS = ["件", "个", "条", "套", "只", "双", "片", "包", "pcs", "PCS"]
+
+
+def _unit_from_product_name(product_name: str) -> str:
+    text = product_name or ""
+    for candidate_unit in _KNOWN_UNITS:
+        if re.search(rf"\d+(?:\.\d+)?\s*{re.escape(candidate_unit)}", text):
+            return candidate_unit
+    return ""
 
 
 def _sort_and_zero_duplicate_box_metrics(rows: list[CustomsRow]) -> None:

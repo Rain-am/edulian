@@ -60,6 +60,35 @@ class BuildCustomsRowsTest(unittest.TestCase):
         self.assertEqual(rows[0].id, rows[1].id)
         self.assertNotEqual(rows[0].id, rows[2].id)
 
+    def test_infers_unit_but_not_customs_name_from_product_name_when_sku_info_missing(self) -> None:
+        raw = RawCustomsData(
+            shipment_items=[
+                ShipmentItem(
+                    shipment_date="2026-06-13",
+                    shipment_no="SP260613017",
+                    sku="251120469195",
+                    quantity=Decimal("1"),
+                    product_name="4条装6分打底裤 2XL-3XL",
+                    box_no="BOX1",
+                )
+            ],
+            sku_infos={
+                "251120469195": SkuInfo(
+                    sku="251120469195",
+                    customs_name_cn="",
+                    unit="",
+                    gross_weight=Decimal("1"),
+                    outer_box_size="1*1*1",
+                )
+            },
+        )
+
+        workbook_data = build_customs_workbook_data(raw)
+
+        self.assertEqual(workbook_data.customs_rows[0].unit, "条")
+        self.assertEqual(workbook_data.customs_rows[0].pieces, Decimal("4"))
+        self.assertEqual(workbook_data.customs_rows[0].customs_name_cn, "待确认")
+
     def test_customs_row_uses_comma_separated_box_no_but_purchase_split_keeps_original(self) -> None:
         original_box_no = "FBA19FS69HZGU000001\nFBA19FS69HZGU000002\nFBA19FS69HZGU000003"
         raw = RawCustomsData(
@@ -106,6 +135,41 @@ class BuildCustomsRowsTest(unittest.TestCase):
         self.assertEqual(workbook_data.customs_rows[0].box_no, "FBA19FS69HZGU000001,FBA19FS69HZGU000002,FBA19FS69HZGU000003")
         self.assertEqual(workbook_data.customs_rows[0].box_count, Decimal("3"))
         self.assertEqual(workbook_data.purchase_split_rows[0].box_no, original_box_no)
+
+    def test_net_weight_uses_display_box_count(self) -> None:
+        raw = RawCustomsData(
+            shipment_items=[
+                ShipmentItem(
+                    shipment_date="2026-06-09",
+                    shipment_no="SP260609001",
+                    sku="SKU1",
+                    quantity=Decimal("1"),
+                    product_name="Product",
+                    box_no="FBA001\nFBA002\nFBA003",
+                    box_count=Decimal("1"),
+                    total_gross_weight=Decimal("30"),
+                    purchase_unit_price=Decimal("1"),
+                    purchase_entity="Purchaser",
+                    supplier="Supplier",
+                    domestic_source="Source",
+                )
+            ],
+            sku_infos={
+                "SKU1": SkuInfo(
+                    sku="SKU1",
+                    product_name="Product",
+                    customs_name_cn="Customs",
+                    unit="pcs",
+                    outer_box_size="10*10*10",
+                )
+            },
+        )
+
+        row = build_customs_workbook_data(raw).customs_rows[0]
+
+        self.assertEqual(row.box_count, Decimal("3"))
+        self.assertEqual(row.total_gross_weight, Decimal("30"))
+        self.assertEqual(row.total_net_weight, Decimal("27"))
 
     def test_main_rows_are_unique_by_shipment_sku_and_box_when_batches_repeat(self) -> None:
         raw = RawCustomsData(
@@ -353,6 +417,8 @@ class BuildCustomsRowsTest(unittest.TestCase):
         row = workbook_data.customs_rows[0]
 
         self.assertEqual(row.product_name, "3条装详情品名")
+        self.assertEqual(row.shipment_date, "2026-05")
+        self.assertEqual(row.shipment_day, "2026-05-01")
         self.assertEqual(row.pieces, Decimal("3"))
         self.assertEqual(row.shipment_quantity, Decimal("15"))
         self.assertEqual(row.updated_at, "2026-06-10 12:00:00")

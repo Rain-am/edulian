@@ -4,12 +4,11 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 from urllib.request import urlopen
 
 from src.product.job import run_product_preview_job
 from src.shipment.job import run_shipment_job
-
-DEFAULT_SHIPMENT_TIME = "2026-06-09"
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,8 +24,8 @@ def parse_args() -> argparse.Namespace:
         "--shipment-time",
         "--ship-date",
         dest="shipment_time",
-        default=DEFAULT_SHIPMENT_TIME,
-        help=f"Shipment date, default {DEFAULT_SHIPMENT_TIME}.",
+        default=None,
+        help="Shipment date. Omit it to run yesterday and today for shipment jobs.",
     )
     parser.add_argument("--output", help="Output .xlsx path.")
     parser.add_argument(
@@ -37,12 +36,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-api",
         action="store_true",
-        help="Save Lingxing API response snapshots to logs/api_debug for troubleshooting.",
+        help="Save Lingxing API timing summaries and failed response snapshots to logs/api_debug.",
+    )
+    parser.add_argument(
+        "--debug-full-api",
+        action="store_true",
+        help="Save full successful Lingxing API responses. This is slower and mainly for deep troubleshooting.",
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Ignore Lingxing master-data cache and fetch fresh SKU, supplier, purchaser, and purchase order data.",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete current Lingxing master-data cache before running.",
     )
     parser.add_argument(
         "--write-db",
         action="store_true",
         help="Write shipment detail rows to MySQL after generating workbook data.",
+    )
+    parser.add_argument(
+        "--db-preflight",
+        action="store_true",
+        help="Check MySQL connection, table columns, unique id index, and row ids without writing data.",
     )
     parser.add_argument("--show-ip", action="store_true", help="Print current public outbound IP for whitelist setup.")
     parser.add_argument("--ip-repeat", type=int, default=1, help="Number of public IP probe rounds for --show-ip.")
@@ -52,17 +71,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Check whether Lingxing access token can be fetched with current .env credentials.",
     )
+    parser.add_argument(
+        "--probe-purchase-order",
+        help="Probe purchaseOrderList request bodies for one purchase order number and print which one matches.",
+    )
     args = parser.parse_args()
-    if args.show_ip or args.check_auth:
+    if args.show_ip or args.check_auth or args.probe_purchase_order:
         return args
+    args.shipment_time_provided = args.shipment_time is not None
     if len(sys.argv) == 1:
         args.job = "shipment"
-        args.shipment_time = DEFAULT_SHIPMENT_TIME
-        args.output = f"output\\real-{DEFAULT_SHIPMENT_TIME}.xlsx"
+        args.shipment_time_provided = False
+        args.output = "output\\real-recent.xlsx"
         args.use_sample_data = False
         return args
+    if args.job != "shipment" and (args.write_db or args.db_preflight):
+        parser.error("--write-db and --db-preflight are only supported for --job shipment")
+    if args.write_db and args.db_preflight:
+        parser.error("--write-db and --db-preflight cannot be used together")
     if not args.output:
-        parser.error("the following arguments are required unless using --show-ip or --check-auth: --output")
+        parser.error("the following arguments are required unless using --show-ip, --check-auth, or --probe-purchase-order: --output")
     return args
 
 
@@ -74,11 +102,19 @@ def main() -> None:
     if args.check_auth:
         check_lingxing_auth()
         return
+    if args.probe_purchase_order:
+        probe_purchase_order(args.probe_purchase_order)
+        return
 
     if args.use_sample_data:
         print("Using sample data. Omit --use-sample-data to call Lingxing API.")
     if args.debug_api:
         os.environ["LINGXING_DEBUG_DIR"] = "logs/api_debug"
+        performance_summary = Path("logs/api_debug/performance_summary.json")
+        if performance_summary.exists():
+            performance_summary.unlink()
+    if args.debug_full_api:
+        os.environ["LINGXING_DEBUG_FULL_API"] = "1"
 
     try:
         if args.job == "product-preview":
@@ -129,6 +165,33 @@ def check_lingxing_auth() -> None:
     else:
         print("Lingxing access token: OK")
         print(f"Token prefix: {token[:6]}...")
+
+
+def probe_purchase_order(purchase_sn: str) -> None:
+    from src.common.lingxing_client import LingxingClient, LingxingClientError
+    from src.shipment.fetcher import _extract_rows, _first_matching_any, _probe_purchase_order_request_bodies
+
+    endpoint = os.getenv("LINGXING_PURCHASE_ORDER_LIST_ENDPOINT", "/erp/sc/routing/data/local_inventory/purchaseOrderList")
+    keys = ("purchase_sn", "purchase_order_no", "po_no", "order_sn", "custom_order_sn", "alibaba_order_sn")
+    client = LingxingClient()
+    print(f"Probing {endpoint} for {purchase_sn}")
+    for index, body in enumerate(_probe_purchase_order_request_bodies(purchase_sn), start=1):
+        try:
+            response = client.post(endpoint, body)
+        except LingxingClientError as exc:
+            print(f"{index}. ERROR body={body} error={exc}")
+            continue
+        rows = _extract_rows(response)
+        matched = _first_matching_any(rows, keys, purchase_sn)
+        code = response.get("code")
+        message = response.get("message") or response.get("msg") or ""
+        matched_no = ""
+        if matched:
+            matched_no = str(next((matched.get(key) for key in keys if matched.get(key)), ""))
+        print(
+            f"{index}. code={code} rows={len(rows)} matched={'YES' if matched else 'NO'} "
+            f"matched_no={matched_no} body={body} message={message}"
+        )
 
 
 if __name__ == "__main__":

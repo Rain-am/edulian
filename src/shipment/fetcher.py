@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from src.common.cache import JsonCache
 from src.common.lingxing_client import LingxingClient, LingxingClientError
 from src.shipment.models import PurchaseBatch, RawCustomsData, ShipmentItem, SkuInfo, decimal_or_zero
 
@@ -15,8 +16,9 @@ from .base import CustomsDataSource
 
 
 class LingxingApiDataSource(CustomsDataSource):
-    def __init__(self, client: LingxingClient | None = None) -> None:
+    def __init__(self, client: LingxingClient | None = None, refresh_cache: bool = False) -> None:
         self.client = client or LingxingClient()
+        self.cache = JsonCache(refresh=refresh_cache)
         self.fba_shipment_list_endpoint = os.getenv(
             "LINGXING_FBA_SHIPMENT_LIST_ENDPOINT",
             "/erp/sc/routing/storage/shipment/getInboundShipmentList",
@@ -206,12 +208,19 @@ class LingxingApiDataSource(CustomsDataSource):
     def _fetch_sku_infos(self, sku_codes: set[str]) -> dict[str, SkuInfo]:
         sku_infos: dict[str, SkuInfo] = {}
         for sku in sorted(sku_codes):
+            cached_payload = self.cache.get("sku_info", sku, ttl_days=30)
+            if isinstance(cached_payload, dict):
+                sku_info = _map_sku_info(sku, cached_payload)
+                sku_infos[sku_info.sku] = sku_info
+                continue
             try:
                 data = self.client.post(self.sku_detail_endpoint, {"sku": sku})
             except LingxingClientError:
                 sku_info = SkuInfo(sku=sku)
             else:
                 payload = data.get("data", data)
+                if _is_valid_payload(payload):
+                    self.cache.set("sku_info", sku, payload)
                 sku_info = _map_sku_info(sku, payload)
             sku_infos[sku_info.sku] = sku_info
         return sku_infos
@@ -239,14 +248,16 @@ class LingxingApiDataSource(CustomsDataSource):
         purchase_orders = self._fetch_purchase_orders({batch.purchase_sn or batch.purchase_order_no for batch in batches})
         purchaser_names = self._fetch_purchaser_names()
         purchaser_names.update(_purchaser_names_from_env())
-        supplier_sources = self._fetch_supplier_sources()
+        supplier_infos = self._fetch_supplier_infos()
 
         enriched: list[PurchaseBatch] = []
         for batch in batches:
             purchase_sn = batch.purchase_sn or batch.purchase_order_no
             purchase_order = purchase_orders.get(purchase_sn, {})
             purchaser_id = _first(purchase_order, {}, "purchaser_id", "purchaserId", "buyer_id", "buyerId")
-            supplier = str(_first(purchase_order, {}, "supplier_name", "supplier", "supplierName") or batch.supplier)
+            supplier_key = str(_first(purchase_order, {}, "supplier_name", "supplier", "supplierName") or batch.supplier)
+            supplier_info = supplier_infos.get(supplier_key, {})
+            supplier = str(supplier_info.get("account_name") or supplier_key)
             purchase_entity = str(
                 _first(
                     purchase_order,
@@ -262,7 +273,7 @@ class LingxingApiDataSource(CustomsDataSource):
                 or purchaser_names.get(str(purchaser_id), "")
                 or batch.purchase_entity
             )
-            domestic_source = str(supplier_sources.get(supplier, "") or batch.domestic_source)
+            domestic_source = str(supplier_info.get("url") or batch.domestic_source)
             enriched.append(
                 PurchaseBatch(
                     shipment_no=batch.shipment_no,
@@ -279,7 +290,7 @@ class LingxingApiDataSource(CustomsDataSource):
                     quantity_missing=batch.quantity_missing,
                 )
             )
-        _dump_purchase_enrichment_summary(batches, enriched, purchase_orders, purchaser_names)
+        _dump_purchase_enrichment_summary(batches, enriched, purchase_orders, purchaser_names, self.cache)
         return enriched
 
     def _fetch_purchase_orders(self, purchase_sns: set[str]) -> dict[str, dict[str, Any]]:
@@ -287,36 +298,38 @@ class LingxingApiDataSource(CustomsDataSource):
         if not self.purchase_order_list_endpoint:
             return orders
         order_keys = ("purchase_sn", "purchase_order_no", "po_no", "order_sn", "custom_order_sn", "alibaba_order_sn")
-        cached_rows: list[dict[str, Any]] = []
         pending_purchase_sns = sorted(sn for sn in purchase_sns if sn)
         for purchase_sn in pending_purchase_sns:
+            cached_order = self.cache.get("purchase_order", purchase_sn, ttl_days=30)
+            if isinstance(cached_order, dict) and _purchase_order_matches(cached_order, order_keys, purchase_sn):
+                orders[purchase_sn] = cached_order
+                continue
             if purchase_sn in orders:
                 continue
-            if cached_rows:
-                matched = _first_matching_any(cached_rows, order_keys, purchase_sn)
-                if matched:
-                    orders[purchase_sn] = matched
-                    continue
             for request_body in _purchase_order_request_bodies(purchase_sn):
                 try:
                     data = self.client.post(self.purchase_order_list_endpoint, request_body)
-                except LingxingClientError:
+                except LingxingClientError as exc:
+                    if _is_permission_or_whitelist_error(exc):
+                        return orders
                     continue
                 rows = _extract_rows(data)
-                if len(rows) > 50 and not cached_rows:
-                    cached_rows = rows
-                    _fill_purchase_orders_from_rows(orders, pending_purchase_sns, cached_rows, order_keys)
                 matched = _first_matching_any(rows, order_keys, purchase_sn)
                 if matched:
                     orders[purchase_sn] = matched
+                    self.cache.set("purchase_order", purchase_sn, matched)
                     break
                 if purchase_sn in orders:
+                    self.cache.set("purchase_order", purchase_sn, orders[purchase_sn])
                     break
         return orders
 
     def _fetch_purchaser_names(self) -> dict[str, str]:
         if not self.purchaser_list_endpoint:
             return {}
+        cached = self.cache.get("purchaser_names", "all", ttl_days=1)
+        if isinstance(cached, dict):
+            return {str(key): str(value) for key, value in cached.items()}
         try:
             rows = self._fetch_offset_rows(self.purchaser_list_endpoint)
         except LingxingClientError:
@@ -327,22 +340,34 @@ class LingxingApiDataSource(CustomsDataSource):
             name = _first(row, {}, "name", "purchaser_name", "purchaserName")
             if purchaser_id not in (None, "") and name not in (None, ""):
                 names[str(purchaser_id)] = str(name)
+        self.cache.set("purchaser_names", "all", names)
         return names
 
-    def _fetch_supplier_sources(self) -> dict[str, str]:
+    def _fetch_supplier_infos(self) -> dict[str, dict[str, str]]:
         if not self.supplier_list_endpoint:
             return {}
+        cached = self.cache.get("supplier_infos", "all", ttl_days=1)
+        if isinstance(cached, dict):
+            return {
+                str(key): {"account_name": str(value.get("account_name", "")), "url": str(value.get("url", ""))}
+                for key, value in cached.items()
+                if isinstance(value, dict)
+            }
         try:
             rows = self._fetch_offset_rows(self.supplier_list_endpoint)
         except LingxingClientError:
             return {}
-        sources: dict[str, str] = {}
+        infos: dict[str, dict[str, str]] = {}
         for row in rows:
-            name = _first(row, {}, "supplier_name", "supplier", "name")
-            source = _first(row, {}, "url", "supplier_url", "website", "address_full", "address", "full_address")
-            if name not in (None, "") and source not in (None, ""):
-                sources[str(name)] = str(source)
-        return sources
+            account_name = _select_supplier_account_name(
+                _first(row, {}, "account_name", "accountName", "account_names", "accountNames")
+            )
+            source = _first(row, {}, "url", "supplier_url", "website")
+            supplier_info = {"account_name": account_name, "url": str(source or "")}
+            for name in _supplier_match_names(row, account_name):
+                infos[name] = supplier_info
+        self.cache.set("supplier_infos", "all", infos)
+        return infos
 
     def _fetch_offset_rows(self, endpoint: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -371,7 +396,9 @@ class LingxingApiDataSource(CustomsDataSource):
 def _map_shipment_item(header: dict[str, Any], payload: dict[str, Any]) -> ShipmentItem:
     box_info = _box_info_for_item(payload)
     return ShipmentItem(
-        shipment_date=_date_text(_first(header, payload, "shipment_time", "shipment_date", "shipping_date", "delivery_date", "shipDate", "shipped_at")),
+        shipment_date=_date_text(
+            _first(header, payload, "pick_time", "shipment_time_second", "shipment_time", "shipment_date", "shipping_date", "delivery_date", "shipDate", "shipped_at")
+        ),
         shipment_no=str(_first(payload, header, "shipment_sn", "shipmentSn", "shipment_no", "shipmentNo", "shipOrderNo", "shipment_id", "id") or ""),
         sku=str(_first(payload, header, "sku", "seller_sku", "local_sku", "msku") or ""),
         quantity=decimal_or_zero(_first(payload, header, "quantity_shipped", "quantity", "qty", "ship_qty", "num")),
@@ -382,8 +409,7 @@ def _map_shipment_item(header: dict[str, Any], payload: dict[str, Any]) -> Shipm
         pieces=decimal_or_zero(_first(payload, header, "pieces", "copy_count", "copies") or 1),
         logistics_provider=str(_first(payload, header, "logistics_provider", "carrier", "logistics_provider_name", "logistics_company") or ""),
         logistics_channel=str(_first(payload, header, "logistics_channel", "logistics_channel_name", "channel", "shipping_channel") or ""),
-        transport_method=str(_first(payload, {}, "method_name") or ""),
-        logistics_method=str(_first(payload, header, "logistics_method", "method_name", "shipping_method", "transport_mode") or ""),
+        transport_method=_transport_method(payload),
         logistics_center_code=str(_first(payload, header, "logistics_center_code", "warehouse_code", "destination_fulfillment_center_id", "fba_warehouse_code") or ""),
         volume=_box_volume_cbm(payload, box_info) or _optional_decimal(_first(payload, header, "volume", "cbm")),
         total_gross_weight=_box_gross_weight(box_info) or _optional_decimal(_first(payload, header, "total_gw", "total_gross_weight")),
@@ -393,20 +419,6 @@ def _map_shipment_item(header: dict[str, Any], payload: dict[str, Any]) -> Shipm
         supplier=str(_first(payload, header, "supplier", "supplier_name") or ""),
         domestic_source=str(_first(payload, header, "domestic_source", "source_place") or ""),
     )
-
-
-def _fill_purchase_orders_from_rows(
-    orders: dict[str, dict[str, Any]],
-    purchase_sns: list[str],
-    rows: list[dict[str, Any]],
-    keys: tuple[str, ...],
-) -> None:
-    for purchase_sn in purchase_sns:
-        if purchase_sn in orders:
-            continue
-        matched = _first_matching_any(rows, keys, purchase_sn)
-        if matched:
-            orders[purchase_sn] = matched
 
 
 def _map_sku_info(sku: str, payload: dict[str, Any]) -> SkuInfo:
@@ -496,6 +508,42 @@ def _updated_at_from_auxs(payload: dict[str, Any]) -> str:
                 if value not in (None, ""):
                     return str(value)
     return str(_first(payload, {}, "gmt_modified", "update_time", "last_update_time") or "")
+
+
+def _transport_method(payload: dict[str, Any]) -> str:
+    return _transport_type_name(payload) or _normalized_transport_method_name(_first(payload, {}, "method_name", "shipping_method", "transport_mode"))
+
+
+def _transport_type_name(payload: dict[str, Any]) -> str:
+    logistics_lists = _as_list(payload.get("head_logistics_list") or payload.get("headLogisticsList"))
+    for logistics in logistics_lists:
+        if not isinstance(logistics, dict):
+            continue
+        tracks = _as_list(logistics.get("track_list") or logistics.get("trackList"))
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            value = track.get("transport_type_name") or track.get("transportTypeName")
+            if value not in (None, ""):
+                return str(value)
+    return ""
+
+
+def _normalized_transport_method_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("海") or "海运" in text:
+        return "海运"
+    if "陆" in text or "卡" in text or "汽运" in text:
+        return "陆运"
+    if "空" in text:
+        return "空运"
+    if "铁" in text:
+        return "铁路"
+    if "快递" in text:
+        return "快递"
+    return text
 
 
 def _map_purchase_batch(item: ShipmentItem, payload: dict[str, Any]) -> PurchaseBatch:
@@ -762,19 +810,47 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _select_supplier_account_name(value: Any) -> str:
+    names: list[str] = []
+    for item in _as_list(value):
+        if isinstance(item, dict):
+            item = _first(item, {}, "account_name", "accountName", "name")
+        for part in re.split(r"[\r\n,;/，；]+", str(item or "")):
+            text = part.strip()
+            if text:
+                names.append(text)
+    if not names:
+        return ""
+    for name in names:
+        if name.endswith("公司") or name.endswith("厂"):
+            return name
+    return names[0]
+
+
+def _supplier_match_names(row: dict[str, Any], account_name: str) -> list[str]:
+    names: list[str] = []
+    for key in ("supplier_name", "supplier", "name", "supplierName", "code", "supplier_code", "supplier_id", "id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            names.append(str(value))
+    if account_name:
+        names.append(account_name)
+
+    distinct: list[str] = []
+    for name in names:
+        if name and name not in distinct:
+            distinct.append(name)
+    return distinct
+
+
 def _purchase_order_request_bodies(purchase_sn: str) -> list[dict[str, Any]]:
     dated_payload = _purchase_order_date_payload(purchase_sn)
-    bodies: list[dict[str, Any]] = []
-    for key in ("order_sn", "custom_order_sn", "purchase_sn", "purchase_order_no", "po_no"):
-        body = dict(dated_payload)
-        body[key] = purchase_sn
-        bodies.append(body)
-    bodies.append(dict(dated_payload))
-    bodies.append({"purchase_sn": purchase_sn})
-    return bodies
+    if not dated_payload:
+        return []
+    return [dict(dated_payload, purchase_sn=purchase_sn)]
 
 
-def _purchase_order_date_payload(purchase_sn: str) -> dict[str, Any]:
+def _purchase_order_date_payload(purchase_sn: str) -> dict[str, Any] | None:
     match = re.search(r"PO(\d{2})(\d{2})(\d{2})", str(purchase_sn or ""))
     if match:
         year = 2000 + int(match.group(1))
@@ -785,7 +861,20 @@ def _purchase_order_date_payload(purchase_sn: str) -> dict[str, Any]:
             return {"start_date": parsed, "end_date": parsed, "search_field_time": "create_time"}
         except ValueError:
             pass
-    return {"start_date": "2024-01-01", "end_date": date.today().isoformat(), "search_field_time": "create_time"}
+    return None
+
+
+def _probe_purchase_order_request_bodies(purchase_sn: str) -> list[dict[str, Any]]:
+    dated_payload = _purchase_order_date_payload(purchase_sn)
+    bodies: list[dict[str, Any]] = []
+    if dated_payload:
+        for key in ("order_sn", "custom_order_sn", "purchase_sn", "purchase_order_no", "po_no"):
+            body = dict(dated_payload)
+            body[key] = purchase_sn
+            bodies.append(body)
+        bodies.append(dict(dated_payload))
+    bodies.append({"purchase_sn": purchase_sn})
+    return bodies
 
 
 def _purchaser_names_from_env() -> dict[str, str]:
@@ -845,6 +934,14 @@ def _extract_rows(data: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _is_valid_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if not payload:
+        return False
+    return any(value not in (None, "", [], {}) for value in payload.values())
+
+
 def _first_matching(rows: list[dict[str, Any]], key: str, value: str) -> dict[str, Any] | None:
     for row in rows:
         if str(row.get(key, "")) == value:
@@ -858,6 +955,10 @@ def _first_matching_any(rows: list[dict[str, Any]], keys: tuple[str, ...], value
         if matched:
             return matched
     return None
+
+
+def _purchase_order_matches(order: dict[str, Any], keys: tuple[str, ...], purchase_sn: str) -> bool:
+    return any(str(order.get(key) or "") == purchase_sn for key in keys)
 
 
 def _coerce_int_string(value: str) -> int | str:
@@ -877,6 +978,21 @@ def _client_page_size(client: Any) -> int:
 def _is_parameter_error(exc: Exception) -> bool:
     text = str(exc)
     return "参数" in text or "parameter" in text.lower() or "code': 102" in text or '"code": 102' in text
+
+
+def _is_permission_or_whitelist_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "ip not permit",
+            "ip address is not allowed",
+            "white list",
+            "whitelist",
+            "permission denied",
+            "no permission",
+        )
+    )
 
 
 def _detail_candidate_values(header: dict[str, Any]) -> list[Any]:
@@ -958,6 +1074,7 @@ def _dump_purchase_enrichment_summary(
     enriched_batches: list[PurchaseBatch],
     purchase_orders: dict[str, dict[str, Any]],
     purchaser_names: dict[str, str],
+    cache: Any | None = None,
 ) -> None:
     debug_dir = os.getenv("LINGXING_DEBUG_DIR", "")
     if not debug_dir:
@@ -976,6 +1093,10 @@ def _dump_purchase_enrichment_summary(
         "purchase_order_found_count": len(purchase_orders),
         "purchaser_id_count": len(purchaser_ids),
         "purchaser_name_found_count": len([purchaser_id for purchaser_id in purchaser_ids if purchaser_id in purchaser_names]),
+        "cache_dir": str(getattr(cache, "cache_dir", "")) if cache is not None else "",
+        "purchase_order_cache_file_count": _cache_file_count(cache, "purchase_order"),
+        "purchaser_names_cache_file_count": _cache_file_count(cache, "purchaser_names"),
+        "supplier_infos_cache_file_count": _cache_file_count(cache, "supplier_infos"),
         "missing_purchase_entity_count": len([batch for batch in enriched_batches if not batch.purchase_entity]),
         "missing_purchase_entity_examples": [
             {
@@ -1013,6 +1134,16 @@ def _dump_purchase_enrichment_summary(
         ][:20],
     }
     (path / "purchase_enrichment_summary.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _cache_file_count(cache: Any | None, namespace: str) -> int:
+    cache_dir = getattr(cache, "cache_dir", None)
+    if cache_dir is None:
+        return 0
+    path = Path(cache_dir) / namespace
+    if not path.exists():
+        return 0
+    return len(list(path.glob("*.json")))
 
 
 def _page_summary(mode: str, payload: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1134,6 +1265,10 @@ def _find_item_rows(payload: Any) -> list[dict[str, Any]]:
                 parent_context["boxList"] = payload["boxList"]
             if "auxs" in payload:
                 parent_context["auxs"] = payload["auxs"]
+            if "head_logistics_list" in payload:
+                parent_context["head_logistics_list"] = payload["head_logistics_list"]
+            if "headLogisticsList" in payload:
+                parent_context["headLogisticsList"] = payload["headLogisticsList"]
             return [dict(parent_context, **row) for row in rows]
     return [payload] if _looks_like_shipment_item(payload) else []
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
@@ -53,6 +54,13 @@ class EnrichmentClient(FakeClient):
             return {
                 "code": 0,
                 "data": {
+                    "head_logistics_list": [
+                        {
+                            "track_list": [
+                                {"transport_type_name": "Rail"},
+                            ]
+                        }
+                    ],
                     "items": [
                         {
                             "sku": "00123",
@@ -60,7 +68,7 @@ class EnrichmentClient(FakeClient):
                             "box_no": "BOX-1",
                             "method_name": "海运",
                             "fba_stock_cost": "5.50",
-                            "purchase_items": [{"purchase_sn": "PO-1", "quantity": 2}],
+                            "purchase_items": [{"purchase_sn": "PO260525005", "quantity": 2}],
                         }
                     ]
                 },
@@ -80,24 +88,44 @@ class EnrichmentClient(FakeClient):
                 },
             }
         if endpoint.endswith("purchaseOrderList"):
-            return {"code": 0, "data": {"list": [{"purchase_sn": "PO-1", "purchaser_id": 7, "supplier_name": "Supplier A"}]}}
+            return {"code": 0, "data": {"list": [{"order_sn": "PO260525005", "purchaser_id": 7, "supplier_name": "Supplier A"}]}}
         if endpoint.endswith("purchaser/lists"):
             return {"code": 0, "data": {"list": [{"id": 7, "name": "Purchaser A"}]}}
         if endpoint.endswith("supplier"):
-            return {"code": 0, "data": {"list": [{"supplier_name": "Supplier A", "url": "https://supplier.example.com", "address_full": "Yiwu Address"}]}}
+            return {
+                "code": 0,
+                "data": {
+                    "list": [
+                        {
+                            "supplier_name": "Supplier A",
+                            "account_name": ["Supplier Shop", "义乌测试公司", "义乌测试厂"],
+                            "url": "https://supplier.example.com",
+                            "address_full": "Yiwu Address",
+                        }
+                    ]
+                },
+            }
         return {"code": 0, "data": {}}
 
 
 class LingxingApiDataSourceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.old_warehouse = os.environ.get("LINGXING_SHIPMENT_WAREHOUSE")
+        self.old_cache_dir = os.environ.get("LINGXING_CACHE_DIR")
+        self.cache_tmp = tempfile.TemporaryDirectory()
         os.environ["LINGXING_SHIPMENT_WAREHOUSE"] = WAREHOUSE
+        os.environ["LINGXING_CACHE_DIR"] = self.cache_tmp.name
 
     def tearDown(self) -> None:
         if self.old_warehouse is None:
             os.environ.pop("LINGXING_SHIPMENT_WAREHOUSE", None)
         else:
             os.environ["LINGXING_SHIPMENT_WAREHOUSE"] = self.old_warehouse
+        if self.old_cache_dir is None:
+            os.environ.pop("LINGXING_CACHE_DIR", None)
+        else:
+            os.environ["LINGXING_CACHE_DIR"] = self.old_cache_dir
+        self.cache_tmp.cleanup()
 
     def test_filters_by_pick_time_and_warehouse(self) -> None:
         client = FakeClient()
@@ -182,52 +210,172 @@ class LingxingApiDataSourceTest(unittest.TestCase):
         self.assertIn("SKU-FAIL", sku_infos)
         self.assertEqual(sku_infos["SKU-FAIL"].product_name, "")
 
+    def test_sku_info_uses_cache_on_second_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache_dir = os.environ.get("LINGXING_CACHE_DIR")
+            os.environ["LINGXING_CACHE_DIR"] = tmp
+            try:
+                client = EnrichmentClient()
+                source = LingxingApiDataSource(client=client)
+                first = source._fetch_sku_infos({"00123"})
+                second = source._fetch_sku_infos({"00123"})
+            finally:
+                if old_cache_dir is None:
+                    os.environ.pop("LINGXING_CACHE_DIR", None)
+                else:
+                    os.environ["LINGXING_CACHE_DIR"] = old_cache_dir
+
+        product_info_calls = [payload for endpoint, payload in client.post_payloads if endpoint.endswith("productInfo")]
+        self.assertEqual(len(product_info_calls), 1)
+        self.assertEqual(first["00123"].unit, "pcs")
+        self.assertEqual(second["00123"].customs_name_cn, "Customs Name")
+
+    def test_purchase_order_cache_must_match_requested_purchase_sn(self) -> None:
+        class PurchaseSnClient(EnrichmentClient):
+            def post(self, endpoint, payload):
+                if endpoint.endswith("purchaseOrderList"):
+                    return {
+                        "code": 0,
+                        "data": {
+                            "list": [
+                                {"order_sn": "PO250917004", "purchaser_id": 113, "supplier_name": "SU00003-SY"},
+                            ]
+                        },
+                    }
+                return super().post(endpoint, payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache_dir = os.environ.get("LINGXING_CACHE_DIR")
+            os.environ["LINGXING_CACHE_DIR"] = tmp
+            try:
+                source = LingxingApiDataSource(client=PurchaseSnClient())
+                source.cache.set("purchase_order", "PO250917004", {"order_sn": "PO-OTHER", "supplier_name": "Supplier A"})
+                orders = source._fetch_purchase_orders({"PO250917004"})
+            finally:
+                if old_cache_dir is None:
+                    os.environ.pop("LINGXING_CACHE_DIR", None)
+                else:
+                    os.environ["LINGXING_CACHE_DIR"] = old_cache_dir
+
+        self.assertEqual(orders["PO250917004"]["order_sn"], "PO250917004")
+
+    def test_refresh_cache_bypasses_sku_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache_dir = os.environ.get("LINGXING_CACHE_DIR")
+            os.environ["LINGXING_CACHE_DIR"] = tmp
+            try:
+                priming_client = EnrichmentClient()
+                LingxingApiDataSource(client=priming_client)._fetch_sku_infos({"00123"})
+                refresh_client = EnrichmentClient()
+                LingxingApiDataSource(client=refresh_client, refresh_cache=True)._fetch_sku_infos({"00123"})
+            finally:
+                if old_cache_dir is None:
+                    os.environ.pop("LINGXING_CACHE_DIR", None)
+                else:
+                    os.environ["LINGXING_CACHE_DIR"] = old_cache_dir
+
+        product_info_calls = [payload for endpoint, payload in refresh_client.post_payloads if endpoint.endswith("productInfo")]
+        self.assertEqual(len(product_info_calls), 1)
+
     def test_load_enriches_purchase_and_supplier_sources(self) -> None:
         client = EnrichmentClient()
         source = LingxingApiDataSource(client=client)
 
         raw = source.load("2026-06-09")
 
+        self.assertEqual(raw.shipment_items[0].shipment_date, "2026-06-09")
         self.assertEqual(raw.shipment_items[0].box_no, "BOX-1")
-        self.assertEqual(raw.shipment_items[0].transport_method, "海运")
+        self.assertEqual(raw.shipment_items[0].transport_method, "Rail")
         self.assertEqual(raw.sku_infos["00123"].customs_name_cn, "Customs Name")
         self.assertEqual(raw.sku_infos["00123"].customs_name_en, "Customs English Name")
-        self.assertEqual(raw.purchase_batches[0].purchase_sn, "PO-1")
+        self.assertEqual(raw.purchase_batches[0].purchase_sn, "PO260525005")
         self.assertEqual(raw.purchase_batches[0].quantity, Decimal("2"))
         self.assertEqual(raw.purchase_batches[0].purchase_entity, "Purchaser A")
-        self.assertEqual(raw.purchase_batches[0].supplier, "Supplier A")
+        self.assertEqual(raw.purchase_batches[0].supplier, "义乌测试公司")
         self.assertEqual(raw.purchase_batches[0].domestic_source, "https://supplier.example.com")
-        self.assertTrue(
-            any(
-                endpoint == "/erp/sc/routing/data/local_inventory/purchaseOrderList"
-                and (payload.get("order_sn") == "PO-1" or payload.get("purchase_sn") == "PO-1")
-                and payload.get("start_date") == "2024-01-01"
-                for endpoint, payload in client.post_payloads
-            )
+        purchase_order_payloads = [payload for endpoint, payload in client.post_payloads if endpoint.endswith("purchaseOrderList")]
+        self.assertEqual(
+            purchase_order_payloads,
+            [{"start_date": "2026-05-25", "end_date": "2026-05-25", "search_field_time": "create_time", "purchase_sn": "PO260525005"}],
         )
 
-    def test_purchase_order_large_response_is_reused_for_remaining_purchase_sns(self) -> None:
-        class BulkPurchaseOrderClient(FakeClient):
+    def test_transport_method_falls_back_to_normalized_method_name_when_track_list_empty(self) -> None:
+        class EmptyTrackListClient(EnrichmentClient):
+            def post(self, endpoint, payload):
+                self.post_payloads.append((endpoint, payload))
+                if endpoint.endswith("getInboundShipmentListMwsDetail"):
+                    return {
+                        "code": 0,
+                        "data": {
+                            "head_logistics_list": {"track_list": []},
+                            "items": [
+                                {
+                                    "sku": "00123",
+                                    "quantity": 2,
+                                    "box_no": "BOX-1",
+                                    "method_name": "海卡",
+                                    "fba_stock_cost": "5.50",
+                                    "purchase_items": [{"purchase_sn": "PO260525005", "quantity": 2}],
+                                }
+                            ],
+                        },
+                    }
+                return super().post(endpoint, payload)
+
+        raw = LingxingApiDataSource(client=EmptyTrackListClient()).load("2026-06-09")
+
+        self.assertEqual(raw.shipment_items[0].transport_method, "海运")
+
+    def test_purchase_order_uses_only_purchase_sn_with_parsed_date(self) -> None:
+        class PurchaseOrderClient(FakeClient):
             def post(self, endpoint, payload):
                 self.post_payloads.append((endpoint, payload))
                 if endpoint.endswith("purchaseOrderList"):
-                    rows = [
-                        {"purchase_sn": f"PO-{index}", "purchaser_id": index, "supplier_name": f"Supplier {index}"}
-                        for index in range(60)
-                    ]
-                    return {"code": 0, "data": {"list": rows}}
+                    return {
+                        "code": 0,
+                        "data": {"list": [{"order_sn": payload["purchase_sn"], "purchaser_id": 113, "supplier_name": "Supplier A"}]},
+                    }
                 return super().post(endpoint, payload)
 
-        client = BulkPurchaseOrderClient()
+        client = PurchaseOrderClient()
         source = LingxingApiDataSource(client=client)
 
-        orders = source._fetch_purchase_orders({"PO-1", "PO-2"})
+        orders = source._fetch_purchase_orders({"PO260525005"})
 
         purchase_order_payloads = [payload for endpoint, payload in client.post_payloads if endpoint.endswith("purchaseOrderList")]
         self.assertEqual(len(purchase_order_payloads), 1)
-        self.assertEqual(purchase_order_payloads[0]["start_date"], "2024-01-01")
-        self.assertEqual(orders["PO-1"]["supplier_name"], "Supplier 1")
-        self.assertEqual(orders["PO-2"]["supplier_name"], "Supplier 2")
+        self.assertEqual(
+            purchase_order_payloads[0],
+            {"start_date": "2026-05-25", "end_date": "2026-05-25", "search_field_time": "create_time", "purchase_sn": "PO260525005"},
+        )
+        self.assertEqual(orders["PO260525005"]["order_sn"], "PO260525005")
+
+    def test_purchase_order_with_unparseable_date_does_not_call_api(self) -> None:
+        client = FakeClient()
+        source = LingxingApiDataSource(client=client)
+
+        orders = source._fetch_purchase_orders({"PO-1"})
+
+        purchase_order_payloads = [payload for endpoint, payload in client.post_payloads if endpoint.endswith("purchaseOrderList")]
+        self.assertEqual(orders, {})
+        self.assertEqual(purchase_order_payloads, [])
+
+    def test_purchase_order_whitelist_error_stops_parameter_attempts(self) -> None:
+        class WhitelistPurchaseOrderClient(FakeClient):
+            def post(self, endpoint, payload):
+                self.post_payloads.append((endpoint, payload))
+                if endpoint.endswith("purchaseOrderList"):
+                    raise LingxingClientError("ip not permit, please add ip to white list first.")
+                return super().post(endpoint, payload)
+
+        client = WhitelistPurchaseOrderClient()
+        source = LingxingApiDataSource(client=client)
+
+        orders = source._fetch_purchase_orders({"PO260101001", "PO260101002"})
+
+        purchase_order_payloads = [payload for endpoint, payload in client.post_payloads if endpoint.endswith("purchaseOrderList")]
+        self.assertEqual(orders, {})
+        self.assertEqual(len(purchase_order_payloads), 1)
 
     def test_detail_child_items_keep_parent_box_and_purchase_items(self) -> None:
         class NestedDetailClient(EnrichmentClient):
@@ -240,7 +388,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
                             "items": [
                                 {
                                     "box_no": "BOX-PARENT",
-                                    "purchase_items": [{"purchase_sn": "PO-1", "quantity": 3}],
+                                    "purchase_items": [{"purchase_sn": "PO260525005", "quantity": 3}],
                                     "products": [{"sku": "00123", "quantity": 3, "fba_stock_cost": "5.50", "shipment_time": "1780985590"}],
                                 }
                             ]
@@ -252,7 +400,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
 
         self.assertEqual(raw.shipment_items[0].box_no, "BOX-PARENT")
         self.assertEqual(raw.shipment_items[0].shipment_date, "2026-06-09")
-        self.assertEqual(raw.purchase_batches[0].purchase_sn, "PO-1")
+        self.assertEqual(raw.purchase_batches[0].purchase_sn, "PO260525005")
         self.assertEqual(raw.purchase_batches[0].purchase_entity, "Purchaser A")
 
     def test_detail_uses_outbound_batch_when_purchase_items_empty(self) -> None:
@@ -271,7 +419,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
                                         {
                                             "warehouse_batch_id": "2606090056-1",
                                             "outbound_num": 14,
-                                            "purchase_order_sns": ["PO-1"],
+                                            "purchase_order_sns": ["PO260525005"],
                                             "supplier_names": ["Supplier A"],
                                             "unit_purchase_price": "$ 5.5000",
                                         }
@@ -284,7 +432,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
 
         raw = LingxingApiDataSource(client=OutboundBatchClient()).load("2026-06-09")
 
-        self.assertEqual(raw.purchase_batches[0].purchase_sn, "PO-1")
+        self.assertEqual(raw.purchase_batches[0].purchase_sn, "PO260525005")
         self.assertEqual(raw.purchase_batches[0].batch_no, "2606090056-1")
         self.assertEqual(raw.purchase_batches[0].quantity, Decimal("14"))
         self.assertEqual(raw.purchase_batches[0].purchase_unit_price, Decimal("5.5000"))
@@ -616,7 +764,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
                         "data": {
                             "list": [
                                 {"order_sn": "PO-OTHER", "purchaser_id": 1, "supplier_name": "Supplier B"},
-                                {"order_sn": "PO-1", "purchaser_id": 7, "supplier_name": "Supplier A"},
+                                {"order_sn": "PO260525005", "purchaser_id": 7, "supplier_name": "Supplier A"},
                             ]
                         },
                     }
@@ -625,7 +773,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
         raw = LingxingApiDataSource(client=OrderSnClient()).load("2026-06-09")
 
         self.assertEqual(raw.purchase_batches[0].purchase_entity, "Purchaser A")
-        self.assertEqual(raw.purchase_batches[0].supplier, "Supplier A")
+        self.assertEqual(raw.purchase_batches[0].supplier, "义乌测试公司")
 
 
 if __name__ == "__main__":

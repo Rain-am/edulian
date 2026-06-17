@@ -1,18 +1,31 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 from decimal import Decimal
 from unittest.mock import patch
 
 import src.shipment.export_mysql as export_mysql
-from src.shipment.export_mysql import MYSQL_COLUMNS, MySQLConfig, MySQLExportError, build_upsert_sql, mysql_row_values, validate_table_columns
-from src.shipment.models import CustomsRow
+from src.shipment.export_mysql import (
+    MYSQL_COLUMNS,
+    MySQLConfig,
+    MySQLExportError,
+    build_delete_before_sql,
+    build_upsert_sql,
+    export_customs_rows_to_mysql,
+    mysql_row_values,
+    preflight_customs_rows_mysql,
+    validate_table_columns,
+    validate_unique_id_index,
+    validate_unique_row_ids,
+)
+from src.shipment.models import CustomsRow, CustomsWorkbookData
 
 
 def sample_row() -> CustomsRow:
     return CustomsRow(
         id="abc123",
         shipment_date="2026-06",
+        shipment_day="2026-06-09",
         shipment_no="SP260609001",
         purchase_entity="采购方",
         supplier="供应商",
@@ -32,7 +45,6 @@ def sample_row() -> CustomsRow:
         logistics_provider="物流商",
         logistics_channel="物流渠道",
         transport_method="快递",
-        logistics_method="旧物流方式",
         logistics_center_code="ABE8",
         package_type="cnts",
         box_no="BOX001",
@@ -48,64 +60,105 @@ class ExportMySQLTest(unittest.TestCase):
     def test_mysql_columns_use_required_order_and_transport_method(self) -> None:
         self.assertEqual([column for _, column in MYSQL_COLUMNS], [
             "id",
-            "shipment_date",
-            "shipment_no",
-            "purchase_entity",
-            "supplier",
-            "domestic_source",
-            "trade_term",
-            "payment_method_name",
+            "confirm_shipment_month",
+            "confirm_shipment",
+            "tran_id",
+            "working_corp_name",
+            "supplier_name",
+            "supplier_addr",
+            "price_term",
+            "pay_term",
             "currency",
-            "sku",
-            "pieces",
-            "product_name",
-            "customs_name_cn",
-            "customs_name_en",
+            "item_code",
+            "copies",
+            "name",
+            "chinese_customs_name",
+            "english_customs_name",
             "unit",
-            "shipment_quantity",
-            "purchase_unit_price",
-            "logistics_provider",
+            "quantity",
+            "purchase_price",
+            "logistics_name",
             "logistics_channel",
-            "transport_method",
-            "logistics_center_code",
-            "package_type",
+            "tran_way",
+            "center_id",
+            "package",
             "box_no",
-            "box_count",
-            "total_gross_weight",
-            "total_net_weight",
-            "outer_box_size",
-            "volume",
-            "updated_at",
+            "packing_carton_num",
+            "item_total_gross_weight",
+            "item_total_net_weight",
+            "measure",
+            "cube",
+            "update_time",
         ])
 
     def test_mysql_row_values_convert_decimals_and_keep_empty_english_name_blank(self) -> None:
         values = mysql_row_values(sample_row())
 
         self.assertEqual(values[0], "abc123")
-        self.assertEqual(values[13], "")
-        self.assertEqual(values[19], "快递")
-        self.assertEqual(values[23], "1")
-        self.assertEqual(values[24], "21.41")
+        self.assertEqual(values[1], "2026-06")
+        self.assertEqual(values[2], "2026-06-09")
+        self.assertEqual(values[14], "")
+        self.assertEqual(values[20], "快递")
+        self.assertEqual(values[24], "1")
+        self.assertEqual(values[25], "21.41")
+
+    def test_mysql_row_values_convert_invalid_shipment_month_to_null(self) -> None:
+        row = sample_row()
+        row.shipment_date = "0"
+
+        values = mysql_row_values(row)
+
+        self.assertIsNone(values[1])
 
     def test_upsert_sql_updates_all_columns_except_id(self) -> None:
         sql = build_upsert_sql("customs_bill_parcels")
 
         self.assertIn("INSERT INTO `customs_bill_parcels`", sql)
-        self.assertIn("`transport_method`", sql)
+        self.assertIn("`confirm_shipment`", sql)
+        self.assertIn("`tran_way`", sql)
         self.assertIn("ON DUPLICATE KEY UPDATE", sql)
         update_clause = sql.split("ON DUPLICATE KEY UPDATE", 1)[1]
         self.assertNotIn("`id`=VALUES(`id`)", update_clause)
-        self.assertIn("`updated_at`=VALUES(`updated_at`)", update_clause)
+        self.assertIn("`update_time`=VALUES(`update_time`)", update_clause)
+
+    def test_delete_before_sql_uses_confirm_shipment(self) -> None:
+        sql = build_delete_before_sql("customs_bill_parcels")
+
+        self.assertEqual(sql, "DELETE FROM `customs_bill_parcels` WHERE `confirm_shipment` < %s")
 
     def test_validate_table_columns_reports_missing_columns(self) -> None:
-        columns = [column for _, column in MYSQL_COLUMNS if column not in {"transport_method", "updated_at"}]
+        columns = [column for _, column in MYSQL_COLUMNS if column not in {"tran_way", "update_time"}]
 
         with self.assertRaises(MySQLExportError) as context:
             validate_table_columns(columns)
 
         message = str(context.exception)
-        self.assertIn("transport_method", message)
-        self.assertIn("updated_at", message)
+        self.assertIn("tran_way", message)
+        self.assertIn("update_time", message)
+
+    def test_validate_unique_id_index_accepts_single_column_unique_id(self) -> None:
+        validate_unique_id_index(
+            [
+                {"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"},
+            ]
+        )
+
+    def test_validate_unique_id_index_rejects_missing_unique_id(self) -> None:
+        with self.assertRaises(MySQLExportError):
+            validate_unique_id_index(
+                [
+                    {"Key_name": "idx_id", "Non_unique": 1, "Seq_in_index": 1, "Column_name": "id"},
+                ]
+            )
+
+    def test_validate_unique_row_ids_reports_duplicates(self) -> None:
+        row = sample_row()
+        duplicate = sample_row()
+
+        with self.assertRaises(MySQLExportError) as context:
+            validate_unique_row_ids(CustomsWorkbookData(customs_rows=[row, duplicate], issue_rows=[], purchase_split_rows=[]))
+
+        self.assertIn("duplicate id", str(context.exception))
 
     def test_open_mysql_connection_uses_direct_host_when_tunnel_disabled(self) -> None:
         fake_pymysql = FakePyMySQL()
@@ -149,6 +202,94 @@ class ExportMySQLTest(unittest.TestCase):
 
         self.assertTrue(fake_tunnel_factory.tunnel.stopped)
 
+    def test_preflight_checks_table_without_upsert(self) -> None:
+        fake_pymysql = FakePyMySQL()
+        fake_pymysql.connection = FakeConnection(
+            columns=[column for _, column in MYSQL_COLUMNS],
+            indexes=[{"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"}],
+        )
+        config = mysql_config(use_ssh_tunnel=False)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql):
+            result = preflight_customs_rows_mysql(
+                CustomsWorkbookData(customs_rows=[sample_row()], issue_rows=[], purchase_split_rows=[]),
+                config,
+            )
+
+        self.assertEqual(result.row_count, 1)
+        self.assertEqual(result.table, "customs_bill_parcels")
+        self.assertIsNone(result.delete_before)
+        self.assertEqual(fake_pymysql.connection.cursor_obj.executemany_calls, [])
+        self.assertFalse(any("DELETE FROM" in sql for sql, _ in fake_pymysql.connection.cursor_obj.execute_calls))
+
+    def test_preflight_reports_delete_cutoff_without_deleting(self) -> None:
+        fake_pymysql = FakePyMySQL()
+        fake_pymysql.connection = FakeConnection(
+            columns=[column for _, column in MYSQL_COLUMNS],
+            indexes=[{"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"}],
+        )
+        config = mysql_config(use_ssh_tunnel=False)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql):
+            result = preflight_customs_rows_mysql(
+                CustomsWorkbookData(customs_rows=[sample_row()], issue_rows=[], purchase_split_rows=[]),
+                config,
+                delete_before="2026-06-16",
+            )
+
+        self.assertEqual(result.delete_before, "2026-06-16")
+        self.assertFalse(any("DELETE FROM" in sql for sql, _ in fake_pymysql.connection.cursor_obj.execute_calls))
+
+    def test_export_deletes_old_rows_before_upsert(self) -> None:
+        fake_pymysql = FakePyMySQL()
+        fake_pymysql.connection = FakeConnection(
+            columns=[column for _, column in MYSQL_COLUMNS],
+            indexes=[{"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"}],
+        )
+        config = mysql_config(use_ssh_tunnel=False)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql):
+            row_count = export_customs_rows_to_mysql(
+                CustomsWorkbookData(customs_rows=[sample_row()], issue_rows=[], purchase_split_rows=[]),
+                config,
+                delete_before="2026-06-16",
+            )
+
+        self.assertEqual(row_count, 1)
+        delete_calls = [call for call in fake_pymysql.connection.cursor_obj.execute_calls if "DELETE FROM" in call[0]]
+        self.assertEqual(delete_calls, [("DELETE FROM `customs_bill_parcels` WHERE `confirm_shipment` < %s", ("2026-06-16",))])
+        self.assertEqual(len(fake_pymysql.connection.cursor_obj.executemany_calls), 1)
+
+    def test_export_still_deletes_old_rows_when_current_batch_is_empty(self) -> None:
+        fake_pymysql = FakePyMySQL()
+        fake_pymysql.connection = FakeConnection(
+            columns=[column for _, column in MYSQL_COLUMNS],
+            indexes=[{"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"}],
+        )
+        config = mysql_config(use_ssh_tunnel=False)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql):
+            row_count = export_customs_rows_to_mysql(
+                CustomsWorkbookData(customs_rows=[], issue_rows=[], purchase_split_rows=[]),
+                config,
+                delete_before="2026-06-16",
+            )
+
+        self.assertEqual(row_count, 0)
+        self.assertTrue(any("DELETE FROM" in sql for sql, _ in fake_pymysql.connection.cursor_obj.execute_calls))
+        self.assertEqual(fake_pymysql.connection.cursor_obj.executemany_calls, [])
+
+    def test_export_rolls_back_only_when_connection_exists(self) -> None:
+        fake_pymysql = FakePyMySQL(connect_error=RuntimeError("mysql down"))
+        config = mysql_config(use_ssh_tunnel=False)
+
+        with patch.object(export_mysql, "PyMySQLModule", fake_pymysql):
+            with self.assertRaises(MySQLExportError):
+                export_mysql.export_customs_rows_to_mysql(
+                    CustomsWorkbookData(customs_rows=[sample_row()], issue_rows=[], purchase_split_rows=[]),
+                    config,
+                )
+
     def test_mysql_config_requires_ssh_settings_when_tunnel_enabled(self) -> None:
         with patch.dict(
             "os.environ",
@@ -188,8 +329,53 @@ def mysql_config(use_ssh_tunnel: bool) -> MySQLConfig:
     )
 
 
+class FakeCursor:
+    def __init__(self, columns=None, indexes=None) -> None:
+        self.columns = columns or []
+        self.indexes = indexes or []
+        self.last_sql = ""
+        self.execute_calls = []
+        self.executemany_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def execute(self, sql, params=None):
+        self.last_sql = sql
+        self.execute_calls.append((sql, params))
+
+    def executemany(self, sql, rows):
+        self.executemany_calls.append((sql, rows))
+
+    def fetchall(self):
+        if "SHOW COLUMNS" in self.last_sql:
+            return [(column,) for column in self.columns]
+        if "SHOW INDEX" in self.last_sql:
+            return self.indexes
+        return []
+
+
 class FakeConnection:
-    pass
+    def __init__(self, columns=None, indexes=None) -> None:
+        self.cursor_obj = FakeCursor(columns=columns, indexes=indexes)
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        self.closed = True
 
 
 class FakePyMySQL:
