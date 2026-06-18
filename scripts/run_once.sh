@@ -5,13 +5,22 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
-SHIPMENT_TIME="${SHIPMENT_TIME:-$(date +%F)}"
-OUTPUT_PATH="${OUTPUT_PATH:-output/real-${SHIPMENT_TIME}.xlsx}"
+JOB="${1:-shipment}"
 
 mkdir -p logs output
 
-"$PYTHON_BIN" main.py \
-  --shipment-time "$SHIPMENT_TIME" \
-  --output "$OUTPUT_PATH" \
-  --write-db \
-  --debug-api
+case "$JOB" in
+  shipment)
+    "$PYTHON_BIN" main.py --job shipment --write-db --debug-api
+    ;;
+  product)
+    "$PYTHON_BIN" main.py --job product --write-db --debug-api
+    ;;
+  product-full-refresh)
+    "$PYTHON_BIN" main.py --job product --write-db --product-full-refresh --debug-api
+    ;;
+  *)
+    echo "Usage: bash scripts/run_once.sh [shipment|product|product-full-refresh]" >&2
+    exit 2
+    ;;
+esac
