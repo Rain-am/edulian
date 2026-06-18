@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from urllib.request import urlopen
 
-from src.product.job import run_product_preview_job
+from src.product.job import run_product_job, run_product_preview_job
 from src.shipment.job import run_shipment_job
 
 
@@ -15,9 +15,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Lingxing customs data jobs.")
     parser.add_argument(
         "--job",
-        choices=("shipment", "product-preview"),
+        choices=("shipment", "product", "product-preview"),
         default="shipment",
-        help="Job to run. Use product-preview to export a 20-row product material preview.",
+        help="Job to run. Use product to sync customs_product, or product-preview to export a preview workbook.",
     )
     parser.add_argument("--limit", type=int, default=20, help="Row limit for product-preview job.")
     parser.add_argument(
@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         help="Write shipment detail rows to MySQL after generating workbook data.",
     )
     parser.add_argument(
+        "--product-full-refresh",
+        action="store_true",
+        help="For --job product, delete customs_product rows first and reload all enabled products.",
+    )
+    parser.add_argument(
         "--db-preflight",
         action="store_true",
         help="Check MySQL connection, table columns, unique id index, and row ids without writing data.",
@@ -85,12 +90,22 @@ def parse_args() -> argparse.Namespace:
         args.output = "output\\real-recent.xlsx"
         args.use_sample_data = False
         return args
-    if args.job != "shipment" and (args.write_db or args.db_preflight):
-        parser.error("--write-db and --db-preflight are only supported for --job shipment")
+    if args.job == "product-preview" and (args.write_db or args.db_preflight):
+        parser.error("--write-db and --db-preflight are not supported for --job product-preview")
+    if args.job == "product" and args.db_preflight:
+        parser.error("--db-preflight is only supported for --job shipment")
+    if args.job == "product" and not args.write_db:
+        parser.error("--job product requires --write-db")
+    if args.product_full_refresh and args.job != "product":
+        parser.error("--product-full-refresh is only supported for --job product")
+    if args.product_full_refresh and not args.write_db:
+        parser.error("--product-full-refresh requires --write-db")
     if args.write_db and args.db_preflight:
         parser.error("--write-db and --db-preflight cannot be used together")
-    if not args.output:
+    if args.job == "product-preview" and not args.output:
         parser.error("the following arguments are required unless using --show-ip, --check-auth, or --probe-purchase-order: --output")
+    if args.job == "shipment" and not (args.output or args.write_db or args.db_preflight):
+        parser.error("the following arguments are required unless using --write-db or --db-preflight: --output")
     return args
 
 
@@ -117,7 +132,9 @@ def main() -> None:
         os.environ["LINGXING_DEBUG_FULL_API"] = "1"
 
     try:
-        if args.job == "product-preview":
+        if args.job == "product":
+            run_product_job(args)
+        elif args.job == "product-preview":
             run_product_preview_job(args)
         else:
             run_shipment_job(args)

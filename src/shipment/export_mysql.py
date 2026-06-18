@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -285,6 +286,33 @@ def validate_unique_row_ids(data: CustomsWorkbookData) -> None:
         raise MySQLExportError(f"Current batch contains duplicate id values: {preview}")
 
 
+def validate_string_lengths(data: CustomsWorkbookData, column_lengths: dict[str, int]) -> None:
+    issues: list[str] = []
+    for row_index, row in enumerate(data.customs_rows, start=1):
+        for attr, column in MYSQL_COLUMNS:
+            max_length = column_lengths.get(column.lower())
+            if not max_length:
+                continue
+            value = _mysql_row_value(attr, getattr(row, attr))
+            if value is None:
+                continue
+            text = str(value)
+            if len(text) <= max_length:
+                continue
+            preview = text[:120].replace("\n", "\\n")
+            issues.append(
+                f"row {row_index}: column={column}, max={max_length}, length={len(text)}, "
+                f"id={row.id}, shipment_no={row.shipment_no}, sku={row.sku}, box_no_length={len(str(row.box_no or ''))}, "
+                f"value_preview={preview}"
+            )
+            if len(issues) >= 10:
+                break
+        if len(issues) >= 10:
+            break
+    if issues:
+        raise MySQLExportError("Current batch contains values longer than MySQL column limits:\n" + "\n".join(issues))
+
+
 def _fetch_table_columns(cursor: Any, table: str) -> set[str]:
     cursor.execute(f"SHOW COLUMNS FROM {_quote_identifier(table)}")
     columns: set[str] = set()
@@ -298,6 +326,20 @@ def _fetch_table_columns(cursor: Any, table: str) -> set[str]:
     return columns
 
 
+def _fetch_table_column_lengths(cursor: Any, table: str) -> dict[str, int]:
+    cursor.execute(f"SHOW COLUMNS FROM {_quote_identifier(table)}")
+    lengths: dict[str, int] = {}
+    for row in cursor.fetchall():
+        field = _row_value(row, "Field", 0)
+        column_type = str(_row_value(row, "Type", 1) or "")
+        if not field:
+            continue
+        match = re.match(r"^(?:var)?char\((\d+)\)", column_type, flags=re.IGNORECASE)
+        if match:
+            lengths[str(field).lower()] = int(match.group(1))
+    return lengths
+
+
 def _fetch_table_indexes(cursor: Any, table: str) -> list[Any]:
     cursor.execute(f"SHOW INDEX FROM {_quote_identifier(table)}")
     return list(cursor.fetchall())
@@ -306,6 +348,7 @@ def _fetch_table_indexes(cursor: Any, table: str) -> list[Any]:
 def _validate_mysql_target(cursor: Any, table: str, data: CustomsWorkbookData) -> None:
     validate_unique_row_ids(data)
     validate_table_columns(_fetch_table_columns(cursor, table))
+    validate_string_lengths(data, _fetch_table_column_lengths(cursor, table))
     validate_unique_id_index(_fetch_table_indexes(cursor, table))
 
 

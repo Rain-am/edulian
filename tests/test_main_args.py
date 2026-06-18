@@ -28,6 +28,33 @@ class MainArgsTest(unittest.TestCase):
         self.assertEqual(args.limit, 20)
         self.assertEqual(args.output, "output\\product-preview-20.xlsx")
 
+    def test_product_write_db_does_not_require_output(self) -> None:
+        with patch.object(sys, "argv", ["main.py", "--job", "product", "--write-db"]):
+            args = main.parse_args()
+
+        self.assertEqual(args.job, "product")
+        self.assertTrue(args.write_db)
+        self.assertIsNone(args.output)
+        self.assertFalse(args.product_full_refresh)
+
+    def test_product_full_refresh_args(self) -> None:
+        with patch.object(sys, "argv", ["main.py", "--job", "product", "--write-db", "--product-full-refresh"]):
+            args = main.parse_args()
+
+        self.assertEqual(args.job, "product")
+        self.assertTrue(args.write_db)
+        self.assertTrue(args.product_full_refresh)
+
+    def test_product_full_refresh_requires_product_job(self) -> None:
+        with patch.object(sys, "argv", ["main.py", "--output", "output\\real.xlsx", "--write-db", "--product-full-refresh"]):
+            with self.assertRaises(SystemExit):
+                main.parse_args()
+
+    def test_product_job_requires_write_db(self) -> None:
+        with patch.object(sys, "argv", ["main.py", "--job", "product"]):
+            with self.assertRaises(SystemExit):
+                main.parse_args()
+
     def test_show_ip_repeat_args_do_not_require_output(self) -> None:
         with patch.object(sys, "argv", ["main.py", "--show-ip", "--ip-repeat", "10", "--ip-interval", "0.2"]):
             args = main.parse_args()
@@ -49,8 +76,16 @@ class MainArgsTest(unittest.TestCase):
         self.assertTrue(args.write_db)
         self.assertFalse(args.shipment_time_provided)
 
+    def test_shipment_write_db_does_not_require_output(self) -> None:
+        with patch.object(sys, "argv", ["main.py", "--job", "shipment", "--write-db"]):
+            args = main.parse_args()
+
+        self.assertEqual(args.job, "shipment")
+        self.assertTrue(args.write_db)
+        self.assertIsNone(args.output)
+
     def test_db_preflight_allows_recent_window_without_explicit_shipment_time(self) -> None:
-        with patch.object(sys, "argv", ["main.py", "--output", "output\\real.xlsx", "--db-preflight"]):
+        with patch.object(sys, "argv", ["main.py", "--db-preflight"]):
             args = main.parse_args()
 
         self.assertTrue(args.db_preflight)

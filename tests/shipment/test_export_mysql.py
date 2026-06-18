@@ -14,6 +14,7 @@ from src.shipment.export_mysql import (
     mysql_row_values,
     preflight_customs_rows_mysql,
     validate_table_columns,
+    validate_string_lengths,
     validate_unique_id_index,
     validate_unique_row_ids,
 )
@@ -129,6 +130,20 @@ class ExportMySQLTest(unittest.TestCase):
         message = str(context.exception)
         self.assertIn("tran_way", message)
         self.assertIn("update_time", message)
+
+    def test_validate_string_lengths_reports_box_no_context(self) -> None:
+        row = sample_row()
+        row.box_no = "B" * 101
+
+        with self.assertRaises(MySQLExportError) as context:
+            validate_string_lengths(CustomsWorkbookData(customs_rows=[row], issue_rows=[], purchase_split_rows=[]), {"box_no": 100})
+
+        message = str(context.exception)
+        self.assertIn("column=box_no", message)
+        self.assertIn("length=101", message)
+        self.assertIn("shipment_no=SP260609001", message)
+        self.assertIn("sku=00123", message)
+        self.assertIn("box_no_length=101", message)
 
     def test_validate_unique_id_index_accepts_single_column_unique_id(self) -> None:
         validate_unique_id_index(
@@ -324,7 +339,7 @@ class FakeCursor:
 
     def fetchall(self):
         if "SHOW COLUMNS" in self.last_sql:
-            return [(column,) for column in self.columns]
+            return [column if isinstance(column, tuple) else (column,) for column in self.columns]
         if "SHOW INDEX" in self.last_sql:
             return self.indexes
         return []

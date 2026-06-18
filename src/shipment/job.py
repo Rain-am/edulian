@@ -23,7 +23,7 @@ def run_shipment_job(args: Any) -> None:
     shipment_times = _shipment_times(args)
     raw_data = _load_raw_data_for_dates(data_source, shipment_times)
     workbook_data = build_customs_workbook_data(raw_data)
-    output_path = _export_with_available_path(workbook_data, Path(args.output))
+    output_path = _export_with_available_path(workbook_data, Path(args.output)) if args.output else None
     if args.db_preflight:
         result = preflight_customs_rows_mysql(workbook_data)
         print("MySQL preflight: OK")
@@ -38,7 +38,10 @@ def run_shipment_job(args: Any) -> None:
         db_rows = export_customs_rows_to_mysql(workbook_data)
         print(f"MySQL rows upserted: {db_rows}")
 
-    print(f"Generated customs workbook: {output_path.resolve()}")
+    if output_path:
+        print(f"Generated customs workbook: {output_path.resolve()}")
+    else:
+        print("Generated customs workbook: skipped (--output not provided)")
     print("Shipment dates: " + ", ".join(shipment_times))
     print(f"Customs rows: {len(workbook_data.customs_rows)}")
     print(f"Issue rows: {len(workbook_data.issue_rows)}")
