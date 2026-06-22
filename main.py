@@ -140,10 +140,13 @@ def main() -> None:
     if args.use_sample_data:
         print("Using sample data. Omit --use-sample-data to call Lingxing API.")
     if args.debug_api:
-        os.environ["LINGXING_DEBUG_DIR"] = "logs/api_debug"
-        performance_summary = Path("logs/api_debug/performance_summary.json")
-        if performance_summary.exists():
+        debug_dir = Path("logs/api_debug") / args.job
+        os.environ["LINGXING_DEBUG_DIR"] = str(debug_dir)
+        performance_summary = debug_dir / "performance_summary.json"
+        try:
             performance_summary.unlink()
+        except FileNotFoundError:
+            pass
     if args.debug_full_api:
         os.environ["LINGXING_DEBUG_FULL_API"] = "1"
 
