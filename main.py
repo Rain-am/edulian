@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -146,16 +147,26 @@ def main() -> None:
     if args.debug_full_api:
         os.environ["LINGXING_DEBUG_FULL_API"] = "1"
 
+    started_at = time.perf_counter()
+    print(f"Job started at: {_format_job_timestamp(datetime.now())}")
     try:
-        if args.job == "product":
-            run_product_job(args)
-        elif args.job == "product-preview":
-            run_product_preview_job(args)
-        else:
-            run_shipment_job(args)
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            if args.job == "product":
+                run_product_job(args)
+            elif args.job == "product-preview":
+                run_product_preview_job(args)
+            else:
+                run_shipment_job(args)
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        print(f"Job finished at: {_format_job_timestamp(datetime.now())}")
+        print(f"Job duration seconds: {time.perf_counter() - started_at:.2f}")
+
+
+def _format_job_timestamp(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def show_public_ips(repeat: int = 1, interval_seconds: float = 1.0) -> None:

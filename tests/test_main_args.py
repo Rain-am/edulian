@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from io import StringIO
 from unittest.mock import patch
 
 import main
@@ -180,6 +181,44 @@ class MainArgsTest(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 main.parse_args()
+
+    def test_main_prints_job_duration_on_success(self) -> None:
+        output = StringIO()
+        with patch.object(sys, "argv", ["main.py", "--job", "shipment", "--write-db"]), patch(
+            "main.run_shipment_job"
+        ), patch("sys.stdout", output):
+            main.main()
+
+        text = output.getvalue()
+        self.assertIn("Job started at:", text)
+        self.assertIn("Job finished at:", text)
+        self.assertIn("Job duration seconds:", text)
+
+    def test_main_prints_job_duration_on_error(self) -> None:
+        output = StringIO()
+        errors = StringIO()
+        with patch.object(sys, "argv", ["main.py", "--job", "shipment", "--write-db"]), patch(
+            "main.run_shipment_job", side_effect=RuntimeError("boom")
+        ), patch("sys.stdout", output), patch("sys.stderr", errors):
+            with self.assertRaises(SystemExit) as context:
+                main.main()
+
+        self.assertEqual(context.exception.code, 1)
+        self.assertIn("Error: boom", errors.getvalue())
+        text = output.getvalue()
+        self.assertIn("Job started at:", text)
+        self.assertIn("Job finished at:", text)
+        self.assertIn("Job duration seconds:", text)
+
+    def test_main_does_not_print_job_duration_for_check_auth(self) -> None:
+        output = StringIO()
+        with patch.object(sys, "argv", ["main.py", "--check-auth"]), patch("main.check_lingxing_auth"), patch(
+            "sys.stdout", output
+        ):
+            main.main()
+
+        self.assertNotIn("Job started at:", output.getvalue())
+        self.assertNotIn("Job duration seconds:", output.getvalue())
 
 
 if __name__ == "__main__":
