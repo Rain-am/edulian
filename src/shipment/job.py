@@ -12,6 +12,7 @@ from src.shipment.export_excel import export_customs_workbook
 from src.shipment.export_mysql import export_customs_rows_to_mysql, preflight_customs_rows_mysql
 from src.shipment.fetcher import LingxingApiDataSource
 from src.shipment.models import RawCustomsData
+from src.shipment.product_master import apply_product_master_data
 from src.shipment.sample_data import SampleDataSource
 
 
@@ -22,6 +23,7 @@ def run_shipment_job(args: Any) -> None:
     data_source = SampleDataSource() if args.use_sample_data else LingxingApiDataSource(refresh_cache=args.refresh_cache)
     shipment_times = _shipment_times(args)
     raw_data = _load_raw_data_for_dates(data_source, shipment_times)
+    _apply_product_master_data(raw_data)
     workbook_data = build_customs_workbook_data(raw_data)
     output_path = _export_with_available_path(workbook_data, Path(args.output)) if args.output else None
     if args.db_preflight:
@@ -76,6 +78,16 @@ def _load_raw_data_for_dates(data_source: Any, shipment_times: list[str]) -> Raw
         combined.sku_infos.update(raw_data.sku_infos)
         combined.metadata.update(raw_data.metadata)
     return combined
+
+
+def _apply_product_master_data(raw_data: RawCustomsData) -> None:
+    try:
+        loaded_rows, applied_rows = apply_product_master_data(raw_data)
+    except Exception as exc:
+        print(f"Warning: failed to load product master data from customs_product: {exc}")
+        return
+    print(f"Product master rows loaded from MySQL: {loaded_rows}")
+    print(f"Product master rows applied to shipment SKU info: {applied_rows}")
 
 
 def _export_with_available_path(workbook_data, output_path: Path) -> Path:

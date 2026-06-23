@@ -49,6 +49,30 @@ class ShipmentJobTest(unittest.TestCase):
 
         export_excel.assert_not_called()
 
+    def test_product_master_failure_does_not_stop_shipment_job(self) -> None:
+        args = SimpleNamespace(
+            clear_cache=False,
+            use_sample_data=True,
+            refresh_cache=False,
+            shipment_time="2026-06-13",
+            shipment_time_provided=True,
+            output=None,
+            db_preflight=False,
+            write_db=False,
+        )
+        workbook_data = SimpleNamespace(customs_rows=[], issue_rows=[], purchase_split_rows=[])
+
+        with (
+            patch("src.shipment.job.SampleDataSource", return_value=FakeShipmentDataSource()),
+            patch("src.shipment.job.apply_product_master_data", side_effect=RuntimeError("db down")),
+            patch("src.shipment.job.build_customs_workbook_data", return_value=workbook_data) as build_rows,
+            patch("src.shipment.job.export_customs_workbook") as export_excel,
+        ):
+            run_shipment_job(args)
+
+        build_rows.assert_called_once()
+        export_excel.assert_not_called()
+
 
 class FakeShipmentDataSource:
     def load(self, shipment_time):
