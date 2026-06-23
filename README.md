@@ -93,7 +93,7 @@ apt install -y git python3 python3-venv python3-pip vim cron
 ```bash
 mkdir -p /opt/lingxing
 cd /opt/lingxing
-git clone https://github.com/Rain-am/edulian.git .
+git clone https://github.com/Rain-am/lingxing_customs.git .
 bash scripts/setup_linux.sh
 ```
 
